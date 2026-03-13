@@ -70,6 +70,10 @@ The `cSettings` in Package.swift define compile flags (`HAVE_CONFIG_H`, `HAVE_SO
 - **tvOS Simulator**: 13.0+ (x86_64, arm64)
 - **Mac Catalyst**: 13.0+ (x86_64, arm64)
 
+## Development Rules
+
+- **Strict TDD**: All new features and bug fixes MUST follow test-driven development. Write failing tests first, then implement the minimum code to make them pass, then refactor. Do not write implementation code without a corresponding failing test already in place.
+
 ## Key Patterns
 
 - **Async pattern**: NFSContext uses a callback-based `async_await` method that polls the NFS file descriptor for events — not Swift structured concurrency.
