@@ -2,170 +2,98 @@
 //  NFSFileHandle.swift
 //  NFSKit
 //
-//  Created by alexiscn on 2021/7/18.
+//  Token-based file handle. The actual nfsfh* lives in the event loop's
+//  handle registry; this type merely holds the handle ID and a reference
+//  to the event loop so it can delegate I/O operations.
+//
+//  Thread Safety: This type is Sendable. The handleID and eventLoop are
+//  both immutable. All mutable state lives on the event loop's serial queue.
 //
 
 import Foundation
 import nfs
 
-class NFSFileHandle {
-    
-    struct SeekWhence: RawRepresentable {
-        var rawValue: Int32
-        
-        static let set     = SeekWhence(rawValue: SEEK_SET)
-        static let current = SeekWhence(rawValue: SEEK_CUR)
-        static let end     = SeekWhence(rawValue: SEEK_END)
-    }
-    
-    private var context: NFSContext
-    private var handle: UnsafeMutablePointer<nfsfh>?
-    
-    convenience init(forReadingAtPath path: String, on context: NFSContext) throws {
-        try self.init(path, flags: O_RDONLY, on: context)
-    }
-    
-    convenience init(forWritingAtPath path: String, on context: NFSContext) throws {
-        try self.init(path, flags: O_WRONLY, on: context)
-    }
-    
-    convenience init(forCreatingAndWritingAtPath path: String, on context: NFSContext) throws {
-        try self.init(path, flags: O_WRONLY | O_CREAT | O_TRUNC, on: context)
-    }
-    
-    convenience init(forCreatingIfNotExistsAtPath path: String, on context: NFSContext) throws {
-        try self.init(path, flags: O_RDWR | O_CREAT | O_EXCL, on: context)
-    }
-    
-    convenience init(forUpdatingAtPath path: String, on context: NFSContext) throws {
-        try self.init(path, flags: O_RDWR | O_APPEND, on: context)
-    }
-    
-    private init(_ path: String, flags: Int32, on context: NFSContext) throws {
-        let (_, handle) = try context.async_await(dataHandler: Parser.toOpaquePointer) { (context, cbPtr) -> Int32 in
-            nfs_open_async(context, path, flags, NFSContext.generic_handler, cbPtr)
-        }
-        self.context = context
-        self.handle = UnsafeMutablePointer<nfsfh>(handle)
-    }
-    
-    deinit {
-        do {
-            let handle = try self.handle.unwrap()
-            try context.async_await { (context, cbPtr) -> Int32 in
-                nfs_close_async(context, handle, NFSContext.generic_handler, cbPtr)
-            }
-        } catch { }
-    }
-    
-    var fileId: nfs_fh? {
-        return try? nfs_get_fh(handle).unwrap().pointee
-    }
-    
-    func close() {
-        guard let handle = handle else { return }
-        self.handle = nil
-        _ = try? context.withThreadSafeContext { (context) in
-            nfs_close(context, handle)
-        }
-    }
-    
-    func fstat() throws -> nfs_stat_64 {
-        let handle = try self.handle.unwrap()
-        return try context.async_await { context, data in
-            let result = try data.unwrap().assumingMemoryBound(to: nfs_stat_64.self).pointee
-            return result
-        } execute: { context, cbPtr in
-            nfs_fstat64_async(context, handle, NFSContext.generic_handler, cbPtr)
-        }.data
+/// A Sendable file handle token.
+///
+/// The underlying NFS file handle pointer (`nfsfh*`) is stored in the
+/// event loop's handle registry, keyed by ``handleID``. All operations
+/// are dispatched to the event loop for execution.
+///
+/// When the token is deallocated, a fire-and-forget close is submitted
+/// to the event loop so the server-side handle is released.
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, macCatalyst 13.0, *)
+public final class NFSFileHandle: Sendable {
 
+    /// The unique identifier for this handle in the event loop's registry.
+    public let handleID: UInt64
+
+    /// The event loop that owns the underlying nfsfh*.
+    internal let eventLoop: NFSEventLoop
+
+    init(handleID: UInt64, eventLoop: NFSEventLoop) {
+        self.handleID = handleID
+        self.eventLoop = eventLoop
     }
-    
-    func ftruncate(toLength: UInt64) throws {
-        let handle = try self.handle.unwrap()
-        try context.async_await { (context, cbPtr) -> Int32 in
-            nfs_ftruncate_async(context, handle, toLength, NFSContext.generic_handler, cbPtr)
-        }
+
+    deinit {
+        let id = handleID
+        let loop = eventLoop
+        loop.closeFileFireAndForget(handleID: id)
     }
-    
-    var maxReadSize: Int {
-        return (try? Int(context.withThreadSafeContext(nfs_get_readmax))) ?? -1
+
+    // MARK: - Read
+
+    /// Read up to `count` bytes from the current file position.
+    public func read(count: UInt64) async throws -> Data {
+        try await eventLoop.readFile(handleID: handleID, count: count)
     }
-    
-    /// This value allows softer streaming
-    var optimizedReadSize: Int {
-        return min(maxReadSize, 1048576)
+
+    /// Positional read: read up to `count` bytes starting at `offset`
+    /// without changing the current file position.
+    public func pread(offset: UInt64, count: UInt64) async throws -> Data {
+        try await eventLoop.preadFile(handleID: handleID, offset: offset, count: count)
     }
-    
+
+    // MARK: - Write
+
+    /// Write `data` at the current file position.
+    /// Returns the number of bytes written.
     @discardableResult
-    func lseek(offset: Int64, whence: SeekWhence) throws -> Int64 {
-        let handle = try self.handle.unwrap()
-        let result = nfs_lseek(context.context, handle, offset, whence.rawValue, nil)
-        if result < 0 {
-            try POSIXError.throwIfError(Int32(result), description: context.error)
-        }
-        return Int64(handle.pointee.offset)
+    public func write(data: Data) async throws -> Int {
+        try await eventLoop.writeFile(handleID: handleID, data: data)
     }
-    
-    func read(length: Int = 0) throws -> Data {
-        precondition(length <= UInt32.max, "Length bigger than UInt32.max can't be handled by libnfs.")
-        
-        let handle = try self.handle.unwrap()
-        let count = length > 0 ? length : optimizedReadSize
-        return try context.async_await(dataHandler: { context, data in
-            return try Data(bytes: data.unwrap(), count: count)
-        }, execute: { (context, cbPtr) -> Int32 in
-            nfs_read_async(context, handle, UInt64(count), NFSContext.generic_handler, cbPtr)
-        }).data
+
+    /// Positional write: write `data` at `offset` without changing the
+    /// current file position. Returns the number of bytes written.
+    @discardableResult
+    public func pwrite(data: Data, offset: UInt64) async throws -> Int {
+        try await eventLoop.pwriteFile(handleID: handleID, offset: offset, data: data)
     }
-    
-    func pread(offset: UInt64, length: Int = 0) throws -> Data {
-        precondition(length <= UInt32.max, "Length bigger than UInt32.max can't be handled by libnfs.")
-        
-        let handle = try self.handle.unwrap()
-        let count = length > 0 ? length : optimizedReadSize
-        return try context.async_await(dataHandler: { context, data in
-            return try Data(bytes: data.unwrap(), count: count)
-        }, execute: { context, cbPtr in
-            nfs_pread_async(context, handle, offset, UInt64(count), NFSContext.generic_handler, cbPtr)
-        }).data
+
+    // MARK: - Metadata
+
+    /// Flush file data to the server.
+    public func fsync() async throws {
+        try await eventLoop.fsync(handleID: handleID)
     }
-    
-    var maxWriteSize: Int {
-        return (try? Int(context.withThreadSafeContext(nfs_get_writemax))) ?? -1
+
+    /// Get file attributes via the open handle.
+    public func fstat() async throws -> nfs_stat_64 {
+        try await eventLoop.fstat(handleID: handleID)
     }
-    
-    var optimizedWriteSize: Int {
-        return min(maxWriteSize, 1048576)
+
+    /// Truncate the file to `toLength` bytes.
+    public func ftruncate(toLength: UInt64) async throws {
+        try await eventLoop.ftruncate(handleID: handleID, toLength: toLength)
     }
-    
-    func write<DataType: DataProtocol>(data: DataType) throws -> Int {
-        precondition(data.count <= Int32.max, "Data bigger than Int32.max can't be handled by libnfs.")
-        
-        let handle = try self.handle.unwrap()
-        var buffer = Array(data)
-        let result = try context.async_await { (context, cbPtr) -> Int32 in
-            nfs_write_async(context, handle, UInt64(buffer.count), &buffer, NFSContext.generic_handler, cbPtr)
-        }
-        return Int(result)
-    }
-    
-    func pwrite<DataType: DataProtocol>(data: DataType, offset: UInt64) throws -> Int {
-        precondition(data.count <= Int32.max, "Data bigger than Int32.max can't be handled by libnfs.")
-        
-        let handle = try self.handle.unwrap()
-        var buffer = Array(data)
-        let result = try context.async_await { (context, cbPtr) -> Int32 in
-            nfs_pwrite_async(context, handle, offset, UInt64(buffer.count), &buffer, NFSContext.generic_handler, cbPtr)
-        }
-        
-        return Int(result)
-    }
-    
-    func fsync() throws {
-        let handle = try self.handle.unwrap()
-        try context.async_await { (context, cbPtr) -> Int32 in
-            nfs_fsync_async(context, handle, NFSContext.generic_handler, cbPtr)
-        }
+
+    /// Seek within the file.
+    /// - Parameters:
+    ///   - offset: The byte offset relative to `whence`.
+    ///   - whence: One of `SEEK_SET`, `SEEK_CUR`, or `SEEK_END`.
+    /// - Returns: The new absolute file position.
+    @discardableResult
+    public func lseek(offset: Int64, whence: Int32) async throws -> UInt64 {
+        try await eventLoop.lseek(handleID: handleID, offset: offset, whence: whence)
     }
 }

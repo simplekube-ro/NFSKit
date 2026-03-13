@@ -2,7 +2,7 @@ import XCTest
 @testable import NFSKit
 
 final class NFSKitTests: XCTestCase {
-    
+
     func testExample() {
         // This is an example of a functional test case.
         // Use XCTAssert and related functions to verify your tests produce the correct
@@ -10,91 +10,52 @@ final class NFSKitTests: XCTestCase {
     }
 }
 
-class NFSBrowser {
-    
-    var client: NFSClient?
-    
-    // url: nfs://xxx.xxx.xxx.xxx
-    init?(url: URL) throws {
-        client = try NFSClient(url: url)
-    }
-    
-    func listExports(handler: @escaping (Result<[String], Error>) -> Void) {
-        client?.listExports(completionHandler: handler)
-    }
-    
-    func mount(export: String, completion: @escaping (Result<Void, Error>) -> Void) {
-        client?.connect(export: export) { error in
-            DispatchQueue.main.async {
-                if let error = error {
-                    completion(.failure(error))
-                } else {
-                    completion(.success(()))
-                }
-            }
-        }
+// MARK: - NFSClient Sendable conformance
+
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, macCatalyst 13.0, *)
+final class NFSClientSendableTests: XCTestCase {
+
+    func testNFSClientIsSendable() throws {
+        let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
+        let _: any Sendable = client
+        // If this compiles, Sendable conformance is verified
+        XCTAssertNotNil(client)
     }
 
-    func listDirectory(at path: String) {
-        client?.contentsOfDirectory(atPath: path) { result in
-            switch result {
-            case .success(let items):
-                for entry in items {
-                    print("name:", entry[.nameKey] as! String,
-                          ", path:", entry[.pathKey] as! String,
-                          ", type:", entry[.fileResourceTypeKey] as! URLFileResourceType,
-                          ", size:", entry[.fileSizeKey] as! Int64,
-                          ", modified:", entry[.contentModificationDateKey] as! Date,
-                          ", created:", entry[.creationDateKey] as! Date)
-                }
-            case .failure(let error):
-                print(error)
-            }
-        }
+    func testNFSClientCreation() throws {
+        let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
+        XCTAssertEqual(client.url.host, "localhost")
     }
 
-    func moveItem(atPath path: String, to toPath: String) {
-        client?.moveItem(atPath: path, toPath: toPath) { error in
-            if let error = error {
-                print(error)
-            }
-        }
+    func testNFSClientReturnsNilForBadURL() throws {
+        // A URL with no host should return nil
+        let client = try NFSClient(url: URL(string: "nfs://")!)
+        XCTAssertNil(client)
     }
 
-    func removeItem(atPath path: String) {
-        client?.removeItem(atPath: path) { error in
-            if let error = error {
-                print(error)
-            }
-        }
+    func testNFSClientConfigurePerformanceDoesNotCrash() throws {
+        let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
+        // configurePerformance is non-throwing and should not crash
+        client.configurePerformance(readMax: 1024)
+        client.configurePerformance(readAhead: 4096)
+        client.configurePerformance(pageCachePages: 256, pageCacheTTL: 60)
+        client.configurePerformance(autoReconnect: -1)
     }
-    
-    func downloadItem(atPath path: String) {
-        let filePath = NSTemporaryDirectory().appending("temp.data")
-        let fileURL = URL(fileURLWithPath: filePath)
-        let progress = Progress(totalUnitCount: 0)
-        client?.downloadItem(atPath: path, to: fileURL) { bytes, total in
-            progress.totalUnitCount = total
-            progress.completedUnitCount = bytes
-            print(progress.fractionCompleted)
-            return true
-        } completionHandler: { error in
-            if let error = error {
-                print(error)
-            }
-        }
+
+    func testNFSClientConfigurePerformanceAllParams() throws {
+        let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
+        client.configurePerformance(
+            readMax: 1_048_576,
+            readAhead: 4096,
+            pageCachePages: 256,
+            pageCacheTTL: 60,
+            autoReconnect: 3
+        )
     }
-    
-    func upload(data: Data, toPath: String) {
-        let progress = Progress(totalUnitCount: Int64(data.count))
-        client?.write(data: data, toPath: toPath) { (uploaded) -> Bool in
-            progress.completedUnitCount = uploaded
-            print(progress.fractionCompleted)
-            return true
-        } completionHandler: { error in
-            if let error = error {
-                print(error)
-            }
-        }
+
+    func testNFSClientConfigurePerformanceAllNils() throws {
+        let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
+        // All nil parameters - should be a no-op
+        client.configurePerformance()
     }
 }

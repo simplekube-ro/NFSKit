@@ -119,54 +119,32 @@ final class NFSContextPerformanceTuningTests: XCTestCase {
     }
 }
 
-// MARK: - NFSClient.configurePerformance
+// MARK: - NFSClient.configurePerformance (new non-throwing API)
 
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, macCatalyst 13.0, *)
 final class NFSClientPerformanceTuningTests: XCTestCase {
 
-    func testConfigurePerformanceThrowsWhenNotConnected() throws {
-        // NFSClient context.unwrap() checks fileDescriptor >= 0,
-        // which is -1 before mount, so this should throw ENOTCONN.
+    func testConfigurePerformanceDoesNotCrash() throws {
         let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
-
-        XCTAssertThrowsError(try client.configurePerformance(readMax: 1024)) { error in
-            guard let posixError = error as? POSIXError else {
-                XCTFail("Expected POSIXError, got \(type(of: error))")
-                return
-            }
-            XCTAssertEqual(posixError.code, .ENOTCONN,
-                           "Should fail with ENOTCONN when not connected")
-        }
+        // configurePerformance is now non-throwing
+        client.configurePerformance(readMax: 1024)
     }
 
-    func testConfigurePerformanceAllNilsThrowsWhenNotConnected() throws {
-        // Even with all nil parameters, the method still calls context.unwrap()
+    func testConfigurePerformanceAllNilsIsNoOp() throws {
         let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
-
-        XCTAssertThrowsError(try client.configurePerformance()) { error in
-            guard let posixError = error as? POSIXError else {
-                XCTFail("Expected POSIXError, got \(type(of: error))")
-                return
-            }
-            XCTAssertEqual(posixError.code, .ENOTCONN)
-        }
+        // All nil parameters should be a no-op, no crash
+        client.configurePerformance()
     }
 
     func testConfigurePerformanceWithMultipleParams() throws {
         let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
-
-        // Verify that passing multiple parameters still hits the same guard
-        XCTAssertThrowsError(try client.configurePerformance(
+        // Should work without errors pre-connect
+        client.configurePerformance(
             readMax: 1_048_576,
             readAhead: 4096,
             pageCachePages: 256,
             pageCacheTTL: 60,
             autoReconnect: -1
-        )) { error in
-            guard let posixError = error as? POSIXError else {
-                XCTFail("Expected POSIXError, got \(type(of: error))")
-                return
-            }
-            XCTAssertEqual(posixError.code, .ENOTCONN)
-        }
+        )
     }
 }
