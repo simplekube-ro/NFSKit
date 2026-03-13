@@ -156,6 +156,36 @@ extension NFSContext {
     
 }
 
+// MARK: - Performance Tuning
+extension NFSContext {
+
+    func setReadMax(_ bytes: UInt64) throws {
+        try withThreadSafeContext { nfs_set_readmax($0, bytes) }
+    }
+
+    func setReadAhead(_ bytes: UInt32) throws {
+        try withThreadSafeContext { nfs_set_readahead($0, bytes) }
+    }
+
+    func setPageCache(pages: UInt32, ttl: UInt32 = 30) throws {
+        try withThreadSafeContext { nfs_set_pagecache($0, pages) }
+        try withThreadSafeContext { nfs_set_pagecache_ttl($0, ttl) }
+    }
+
+    @discardableResult
+    func setVersion(_ version: Int32) throws -> Int32 {
+        return try withThreadSafeContext { nfs_set_version($0, version) }
+    }
+
+    func getVersion() throws -> Int32 {
+        return try withThreadSafeContext { nfs_get_version($0) }
+    }
+
+    func setAutoReconnect(_ retries: Int32) throws {
+        try withThreadSafeContext { nfs_set_autoreconnect($0, retries) }
+    }
+}
+
 // MARK: - File Operation
 extension NFSContext {
     

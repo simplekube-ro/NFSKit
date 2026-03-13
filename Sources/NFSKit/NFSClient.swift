@@ -44,6 +44,31 @@ public class NFSClient: NSObject {
         }
     }
     
+    /// Configure libnfs performance parameters before mounting.
+    /// Must be called before `connect(export:)` — some settings are read during mount negotiation.
+    ///
+    /// - Parameters:
+    ///   - readMax: Override server-negotiated maximum read size in bytes
+    ///   - readAhead: Enable read-ahead with max bytes to prefetch
+    ///   - pageCachePages: Number of pages for libnfs page cache
+    ///   - pageCacheTTL: Page cache TTL in seconds (default 30 if pageCachePages is set)
+    ///   - autoReconnect: Number of auto-reconnect retries (-1 = infinite, 0 = disabled)
+    open func configurePerformance(
+        readMax: UInt64? = nil,
+        readAhead: UInt32? = nil,
+        pageCachePages: UInt32? = nil,
+        pageCacheTTL: UInt32? = nil,
+        autoReconnect: Int32? = nil
+    ) throws {
+        let ctx = try context.unwrap()
+        if let readMax { try ctx.setReadMax(readMax) }
+        if let readAhead { try ctx.setReadAhead(readAhead) }
+        if let pages = pageCachePages {
+            try ctx.setPageCache(pages: pages, ttl: pageCacheTTL ?? 30)
+        }
+        if let retries = autoReconnect { try ctx.setAutoReconnect(retries) }
+    }
+
     /// Initializes a NFSClient class with given url
     /// - Parameter url: The nfs url, should has with nfs:// scheme
     /// - Throws: error
