@@ -8,3 +8,11 @@ cmake -DCMAKE_BUILD_TYPE=Release \
             $SRC/$1
 make -j5 -s
 make -j5 install -s
+
+# Copy cmake-generated config.h to Swift C module shim (first build wins —
+# all Apple platform slices produce identical config.h values)
+CONFIG_DST="$ROOT/Sources/nfs/include/config.h"
+if [ -f config.h ] && [ ! -f "$CONFIG_DST.updated" ]; then
+    cp config.h "$CONFIG_DST"
+    touch "$CONFIG_DST.updated"
+fi

@@ -107,9 +107,7 @@ final class NFSEventLoopTests: XCTestCase {
 
     func testPerformanceTuningPreConnect() throws {
         let loop = try NFSEventLoop(timeout: 30)
-        XCTAssertNoThrow(try loop.setReadMax(1_048_576))
-        XCTAssertNoThrow(try loop.setReadAhead(4096))
-        XCTAssertNoThrow(try loop.setPageCache(pages: 256, ttl: 60))
+        XCTAssertNoThrow(try loop.setReadMax(1_048_576 as Int))
         XCTAssertNoThrow(try loop.setAutoReconnect(3))
     }
 
@@ -149,7 +147,8 @@ final class NFSEventLoopTests: XCTestCase {
         let op = NFSEventLoop.PendingOperation(
             id: 1,
             type: .read,
-            execute: { _ in 0 }
+            execute: { _ in 0 },
+            failureCleanup: { _, _ in }
         )
         XCTAssertEqual(op.type, .read)
         XCTAssertEqual(op.type.category, .bulk)
@@ -163,6 +162,57 @@ final class NFSEventLoopTests: XCTestCase {
         let counts = loop.inFlightCounts
         XCTAssertEqual(counts[.bulk], 0, "Initial bulk in-flight count should be 0")
         XCTAssertEqual(counts[.metadata], 0, "Initial metadata in-flight count should be 0")
+    }
+
+    // MARK: 13. getReadMax returns a positive value after context creation
+
+    func testGetReadMaxReturnsPositiveValue() throws {
+        let loop = try NFSEventLoop(timeout: 30)
+        let readMax = try loop.getReadMax()
+        // libnfs defaults to some positive chunk size (e.g. 1048576 or 131072).
+        XCTAssertGreaterThan(readMax, 0, "getReadMax() should return a positive byte count")
+    }
+
+    // MARK: 14. getReadMax reflects the value set by setReadMax
+
+    func testGetReadMaxReflectsSetReadMax() throws {
+        let loop = try NFSEventLoop(timeout: 30)
+        let desiredReadMax = 131_072
+        try loop.setReadMax(desiredReadMax)
+        let readMax = try loop.getReadMax()
+        XCTAssertEqual(readMax, desiredReadMax, "getReadMax() should reflect the value set by setReadMax()")
+    }
+
+    // MARK: 15. getReadMax throws after shutdown
+
+    func testGetReadMaxThrowsAfterShutdown() throws {
+        let loop = try NFSEventLoop(timeout: 30)
+        loop.shutdown()
+        // After shutdown, context is nil. Optional.unwrap() on nil throws ENODATA.
+        XCTAssertThrowsError(try loop.getReadMax()) { error in
+            XCTAssertNotNil(error as? POSIXError,
+                            "getReadMax() should throw a POSIXError after shutdown")
+        }
+    }
+
+    // MARK: 16. preadIntoBuffer throws ENOTCONN without a live connection
+
+    func testPreadIntoBufferThrowsWithoutConnection() async throws {
+        let loop = try NFSEventLoop(timeout: 30)
+        // No connection — pread on a non-existent handle ID must throw EBADF.
+        let buffer = ReadBuffer(byteCount: 1024)
+        do {
+            _ = try await loop.preadIntoBuffer(
+                handleID: 9999,
+                buffer: buffer.pointer,
+                offset: 0,
+                count: 1024
+            )
+            XCTFail("preadIntoBuffer should throw for an invalid handle ID")
+        } catch let error as POSIXError {
+            XCTAssertEqual(error.code, .EBADF,
+                           "Expected EBADF for an invalid handle ID, got \(error.code)")
+        }
     }
 }
 

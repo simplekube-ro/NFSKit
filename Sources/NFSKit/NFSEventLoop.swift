@@ -34,6 +34,10 @@ final class NFSEventLoop: @unchecked Sendable {
         let id: UInt64
         let type: OperationType
         let execute: (UnsafeMutablePointer<nfs_context>) -> Int32
+        /// Called when the nfs_*_async call returns rc < 0 after deferred issue.
+        /// Responsible for releasing the retained CallbackData pointer and resuming
+        /// the continuation with an appropriate error.
+        let failureCleanup: (Int32, UnsafeMutablePointer<nfs_context>) -> Void
     }
 
     /// Callback data stored in a heap-allocated object. A pointer to this
@@ -105,6 +109,26 @@ final class NFSEventLoop: @unchecked Sendable {
     private var activeContinuations: [UInt64: CallbackData] = [:]
     private var nextContinuationID: UInt64 = 1
 
+    // MARK: - Log Handler Support
+
+    /// Box that holds a log handler closure on the heap.
+    ///
+    /// A pointer to this object is passed as `private_data` to `rpc_set_log_cb`.
+    /// We keep the box alive (via `Unmanaged.passRetained`) for as long as the
+    /// C-level callback registration is active, then release it in `setLogHandler`
+    /// when the registration is replaced, or in `deinit` via `performShutdown`.
+    final class LogHandlerBox: @unchecked Sendable {
+        let handler: @Sendable (Int, String) -> Void
+        init(_ handler: @escaping @Sendable (Int, String) -> Void) {
+            self.handler = handler
+        }
+    }
+
+    /// Opaque pointer to the currently registered `LogHandlerBox`.
+    /// Held as a raw pointer so the value can cross C boundaries easily.
+    /// `nil` when no log handler is registered.
+    private var logHandlerBoxPtr: UnsafeMutableRawPointer?
+
     // MARK: - Initialisation
 
     init(timeout: TimeInterval) throws {
@@ -144,6 +168,17 @@ final class NFSEventLoop: @unchecked Sendable {
         cancelSources()
         cancelTimeoutTimer()
 
+        // Deregister the log callback and release the handler box before
+        // destroying the context, so no log callbacks fire after deallocation.
+        if let oldPtr = logHandlerBoxPtr {
+            if let ctx = context {
+                let rpc = nfs_get_rpc_context(ctx)
+                rpc_set_log_cb(rpc, nil, nil)
+            }
+            Unmanaged<LogHandlerBox>.fromOpaque(oldPtr).release()
+            logHandlerBoxPtr = nil
+        }
+
         let error = POSIXError(.ENOTCONN, description: "Event loop shut down")
 
         // Snapshot and clear continuations BEFORE destroying the context,
@@ -153,11 +188,9 @@ final class NFSEventLoop: @unchecked Sendable {
 
         pendingOperations.removeAll()
 
-        if let ctx = context {
-            for (_, handle) in handleRegistry {
-                nfs_close(ctx, handle)
-            }
-        }
+        // Do NOT call nfs_close here: nfs_close is synchronous and runs an
+        // internal poll() loop, which would block the serial queue. Instead,
+        // just drop the registry — nfs_destroy_context cleans up open handles.
         handleRegistry.removeAll()
 
         if let ctx = context {
@@ -352,6 +385,9 @@ final class NFSEventLoop: @unchecked Sendable {
                 let rc = op.execute(ctx)
                 if rc < 0 {
                     _inFlightCount[category, default: 0] -= 1
+                    // Release the retained CallbackData pointer and resume the
+                    // continuation with a failure — otherwise both leak.
+                    op.failureCleanup(rc, ctx)
                 }
                 updateWriteSource()
             } else {
@@ -435,6 +471,11 @@ final class NFSEventLoop: @unchecked Sendable {
                         type: type,
                         execute: { ctx in
                             execute(ctx, retainedPtr)
+                        },
+                        failureCleanup: { [weak self] rc, ctx in
+                            Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
+                            self?.activeContinuations.removeValue(forKey: contID)
+                            cbData.resume(.failure(POSIXError(.init(Int32(-rc)), description: String(cString: nfs_get_error(ctx)))))
                         }
                     )
                     pendingOperations.append(pending)
@@ -498,6 +539,11 @@ final class NFSEventLoop: @unchecked Sendable {
                         type: type,
                         execute: { ctx in
                             execute(ctx, retainedPtr)
+                        },
+                        failureCleanup: { [weak self] rc, ctx in
+                            Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
+                            self?.activeContinuations.removeValue(forKey: contID)
+                            cbData.resume(.failure(POSIXError(.init(Int32(-rc)), description: String(cString: nfs_get_error(ctx)))))
                         }
                     )
                     pendingOperations.append(pending)
@@ -558,6 +604,21 @@ final class NFSEventLoop: @unchecked Sendable {
             cbData.completionHook(success)
             cbData.resume(result)
         }
+    }
+
+    /// The C callback for libnfs log messages.
+    ///
+    /// `private_data` is an unretained pointer to a `LogHandlerBox`. The box
+    /// stays alive for the entire lifetime of the registration, so we use
+    /// `takeUnretainedValue()` here — ownership is managed by `logHandlerBoxPtr`.
+    ///
+    /// This callback fires on the event-loop queue (inside `nfs_service`), so
+    /// it is already serialised and does not need additional locking.
+    static let logCallback: rpc_log_cb = { _, level, messagePtr, privateData in
+        guard let privateData = privateData, let messagePtr = messagePtr else { return }
+        let box = Unmanaged<LogHandlerBox>.fromOpaque(privateData).takeUnretainedValue()
+        let message = String(cString: messagePtr)
+        box.handler(Int(level), message)
     }
 
     /// The C callback for RPC operations (getexports).
@@ -644,6 +705,14 @@ final class NFSEventLoop: @unchecked Sendable {
         }
     }
 
+    // TODO: C5 — getexports hangs because mount_getexports_async opens its own
+    // RPC connection with a separate fd.  No DispatchSource is registered for
+    // that fd, so nfs_service is never called and the rpcCallback never fires.
+    // Fix: after mount_getexports_async succeeds, obtain the rpc fd via
+    // rpc_get_fd(rpc), create temporary read/write DispatchSources that call
+    // rpc_service(rpc, revents), and tear them down inside the rpcCallback.
+    // This requires libnfs rpc_service/rpc_get_fd to be exposed through the
+    // C bridge (nfs_shim.h) and is tracked as a follow-up task.
     func getexports(server: String) async throws -> [String] {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
             queue.async { [self] in
@@ -852,20 +921,27 @@ final class NFSEventLoop: @unchecked Sendable {
                 let contID = nextContinuationID
                 nextContinuationID += 1
 
-                // For read, status > 0 means bytes read. The static nfsCallback
-                // passes status >= 0 to dataHandler, which interprets it.
+                // libnfs 6.x read_async requires a caller-allocated buffer.
+                // Allocate it here; ownership passes to Data on success, or we
+                // deallocate it on error/EOF.
+                let readBuf = UnsafeMutableRawPointer.allocate(byteCount: Int(count), alignment: 1)
+
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
-                    dataHandler: { status, dataPtr in
+                    dataHandler: { status, _ in
                         if status > 0 {
                             let byteCount = Int(status)
-                            if let dataPtr = dataPtr {
-                                return .success(Data(bytes: dataPtr, count: byteCount))
-                            }
-                            return .success(Data())
+                            // Transfer buffer ownership to Data; Data.deallocator
+                            // will call readBuf.deallocate() when done.
+                            return .success(Data(
+                                bytesNoCopy: readBuf,
+                                count: byteCount,
+                                deallocator: .custom { ptr, _ in ptr.deallocate() }
+                            ))
                         }
-                        // status == 0 means EOF
+                        // status == 0 is EOF; no bytes to return.
+                        readBuf.deallocate()
                         return .success(Data())
                     },
                     resume: { result in
@@ -884,8 +960,9 @@ final class NFSEventLoop: @unchecked Sendable {
                 activeContinuations[contID] = cbData
 
                 let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
-                let rc = nfs_read_async(ctx, handle, count, NFSEventLoop.nfsCallback, retainedPtr)
+                let rc = nfs_read_async(ctx, handle, readBuf, Int(count), NFSEventLoop.nfsCallback, retainedPtr)
                 if rc < 0 {
+                    readBuf.deallocate()
                     Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
                     activeContinuations.removeValue(forKey: contID)
                     cont.resume(throwing: POSIXError(.init(Int32(-rc)), description: errorDescription(ctx)))
@@ -914,10 +991,25 @@ final class NFSEventLoop: @unchecked Sendable {
                 let contID = nextContinuationID
                 nextContinuationID += 1
 
+                // Heap-allocate a stable write buffer.  libnfs stores a raw pointer
+                // to this memory inside its PDU iovec and may access it after
+                // nfs_write_async returns, so the Array-backed buffer from
+                // `withUnsafeBufferPointer` is not safe here — it can be released
+                // as soon as the closure exits.  We copy the bytes into a
+                // heap-allocated region and deallocate it once the callback fires.
+                let writeBytes = Array(writeData)
+                let writeBuf = UnsafeMutableRawPointer.allocate(
+                    byteCount: writeBytes.count, alignment: 1
+                )
+                writeBytes.withUnsafeBufferPointer { src in
+                    writeBuf.copyMemory(from: src.baseAddress!, byteCount: writeBytes.count)
+                }
+
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
                     dataHandler: { status, _ in
+                        defer { writeBuf.deallocate() }
                         return .success(Int(status))
                     },
                     resume: { result in
@@ -936,11 +1028,10 @@ final class NFSEventLoop: @unchecked Sendable {
                 activeContinuations[contID] = cbData
 
                 let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
-                let buffer = Array(writeData)
-                let rc = buffer.withUnsafeBufferPointer { bufPtr in
-                    nfs_write_async(ctx, handle, UInt64(buffer.count), bufPtr.baseAddress, NFSEventLoop.nfsCallback, retainedPtr)
-                }
+                // libnfs 6.x: nfs_write_async(ctx, fh, buf, count, cb, priv)
+                let rc = nfs_write_async(ctx, handle, writeBuf, writeBytes.count, NFSEventLoop.nfsCallback, retainedPtr)
                 if rc < 0 {
+                    writeBuf.deallocate()
                     Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
                     activeContinuations.removeValue(forKey: contID)
                     cont.resume(throwing: POSIXError(.init(Int32(-rc)), description: errorDescription(ctx)))
@@ -968,17 +1059,22 @@ final class NFSEventLoop: @unchecked Sendable {
                 let contID = nextContinuationID
                 nextContinuationID += 1
 
+                // libnfs 6.x pread_async requires a caller-allocated buffer.
+                let preadBuf = UnsafeMutableRawPointer.allocate(byteCount: Int(count), alignment: 1)
+
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
-                    dataHandler: { status, dataPtr in
+                    dataHandler: { status, _ in
                         if status > 0 {
                             let byteCount = Int(status)
-                            if let dataPtr = dataPtr {
-                                return .success(Data(bytes: dataPtr, count: byteCount))
-                            }
-                            return .success(Data())
+                            return .success(Data(
+                                bytesNoCopy: preadBuf,
+                                count: byteCount,
+                                deallocator: .custom { ptr, _ in ptr.deallocate() }
+                            ))
                         }
+                        preadBuf.deallocate()
                         return .success(Data())
                     },
                     resume: { result in
@@ -997,7 +1093,100 @@ final class NFSEventLoop: @unchecked Sendable {
                 activeContinuations[contID] = cbData
 
                 let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
-                let rc = nfs_pread_async(ctx, handle, offset, count, NFSEventLoop.nfsCallback, retainedPtr)
+                // libnfs 6.x: nfs_pread_async(ctx, fh, buf, count, offset, cb, priv)
+                let rc = nfs_pread_async(ctx, handle, preadBuf, Int(count), offset, NFSEventLoop.nfsCallback, retainedPtr)
+                if rc < 0 {
+                    preadBuf.deallocate()
+                    Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
+                    activeContinuations.removeValue(forKey: contID)
+                    cont.resume(throwing: POSIXError(.init(Int32(-rc)), description: errorDescription(ctx)))
+                } else {
+                    _inFlightCount[.bulk, default: 0] += 1
+                    updateWriteSource()
+                }
+            }
+        }
+    }
+
+    /// Positional read from a file handle into a caller-owned buffer.
+    ///
+    /// Unlike ``preadFile(handleID:offset:count:)`` which allocates its own buffer and
+    /// returns a `Data` value, this variant writes directly into `buffer` at the
+    /// address provided by the caller.  This enables the zero-copy pre-allocated buffer
+    /// path in ``NFSClient.contents(atPath:)``.
+    ///
+    /// The caller must ensure `buffer` remains valid until the returned task completes.
+    /// The buffer pointer must point to at least `count` bytes of writable memory.
+    ///
+    /// - Parameters:
+    ///   - handleID: The token identifying the open file handle.
+    ///   - buffer: A pointer into the pre-allocated destination region.
+    ///   - offset: The byte offset within the file to read from.
+    ///   - count: The number of bytes to request.
+    /// - Returns: The number of bytes actually written into `buffer`
+    ///   (`<= count`; may be less for the final chunk at EOF).
+    /// - Throws: `POSIXError(.EBADF)` for an unknown handle ID,
+    ///   `POSIXError(.ENOTCONN)` if the event loop has shut down,
+    ///   or an error from libnfs for NFS-level failures.
+    func preadIntoBuffer(
+        handleID: UInt64,
+        buffer destBuffer: UnsafeMutableRawPointer,
+        offset: UInt64,
+        count: UInt64
+    ) async throws -> Int {
+        // Wrap the raw pointer so it can cross the @Sendable closure boundary.
+        // Safety: the buffer is caller-allocated and remains valid until the
+        // continuation resumes (the caller holds the ReadBuffer alive for the
+        // duration of the await).
+        let sendableBuffer = SendableRawPointer(pointer: destBuffer)
+
+        return try await withCheckedThrowingContinuation { (cont: CheckedContinuation<Int, Error>) in
+            queue.async { [self] in
+                guard let handle = handleRegistry[handleID] else {
+                    cont.resume(throwing: POSIXError(.EBADF, description: "Invalid file handle"))
+                    return
+                }
+                guard let ctx = context else {
+                    cont.resume(throwing: POSIXError(.ENOTCONN, description: "Not connected"))
+                    return
+                }
+
+                let contID = nextContinuationID
+                nextContinuationID += 1
+
+                // The caller-provided buffer is passed directly to libnfs.
+                // No additional allocation is needed; the caller owns the memory
+                // and is responsible for keeping it live until the callback fires.
+                let cbData = CallbackData(
+                    continuationID: contID,
+                    operationCategory: .bulk,
+                    dataHandler: { status, _ in
+                        // status > 0: bytes written to destBuffer.
+                        // status == 0: EOF (0 bytes read).
+                        // Negative values are filtered before this handler is called.
+                        return .success(Int(max(0, status)))
+                    },
+                    resume: { result in
+                        switch result {
+                        case .success(let value):
+                            cont.resume(returning: value as! Int)
+                        case .failure(let error):
+                            cont.resume(throwing: error)
+                        }
+                    },
+                    completionHook: { [weak self] success in
+                        self?.handleCallbackCompletion(contID: contID, category: .bulk, success: success)
+                    }
+                )
+
+                activeContinuations[contID] = cbData
+
+                let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
+                // libnfs 6.x: nfs_pread_async(ctx, fh, buf, count, offset, cb, priv)
+                let rc = nfs_pread_async(
+                    ctx, handle, sendableBuffer.pointer, Int(count), offset,
+                    NFSEventLoop.nfsCallback, retainedPtr
+                )
                 if rc < 0 {
                     Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
                     activeContinuations.removeValue(forKey: contID)
@@ -1026,10 +1215,22 @@ final class NFSEventLoop: @unchecked Sendable {
                 let contID = nextContinuationID
                 nextContinuationID += 1
 
+                // Same heap-allocation pattern as writeFile: libnfs stores a raw
+                // pointer into the PDU iovec and may access it after nfs_pwrite_async
+                // returns, so the stack/Array-backed buffer is not safe here.
+                let writeBytes = Array(writeData)
+                let writeBuf = UnsafeMutableRawPointer.allocate(
+                    byteCount: writeBytes.count, alignment: 1
+                )
+                writeBytes.withUnsafeBufferPointer { src in
+                    writeBuf.copyMemory(from: src.baseAddress!, byteCount: writeBytes.count)
+                }
+
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
                     dataHandler: { status, _ in
+                        defer { writeBuf.deallocate() }
                         return .success(Int(status))
                     },
                     resume: { result in
@@ -1048,11 +1249,10 @@ final class NFSEventLoop: @unchecked Sendable {
                 activeContinuations[contID] = cbData
 
                 let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
-                let buffer = Array(writeData)
-                let rc = buffer.withUnsafeBufferPointer { bufPtr in
-                    nfs_pwrite_async(ctx, handle, offset, UInt64(buffer.count), bufPtr.baseAddress, NFSEventLoop.nfsCallback, retainedPtr)
-                }
+                // libnfs 6.x: nfs_pwrite_async(ctx, fh, buf, count, offset, cb, priv)
+                let rc = nfs_pwrite_async(ctx, handle, writeBuf, writeBytes.count, offset, NFSEventLoop.nfsCallback, retainedPtr)
                 if rc < 0 {
+                    writeBuf.deallocate()
                     Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
                     activeContinuations.removeValue(forKey: contID)
                     cont.resume(throwing: POSIXError(.init(Int32(-rc)), description: errorDescription(ctx)))
@@ -1352,25 +1552,24 @@ final class NFSEventLoop: @unchecked Sendable {
 
     // MARK: - Performance Tuning (pre-connect)
 
-    func setReadMax(_ bytes: UInt64) throws {
+    func setReadMax(_ bytes: Int) throws {
         try queue.sync {
             let ctx = try context.unwrap()
             nfs_set_readmax(ctx, bytes)
         }
     }
 
-    func setReadAhead(_ bytes: UInt32) throws {
+    /// Returns the maximum read size libnfs will use for a single RPC read call.
+    ///
+    /// Before a mount, this reflects the configured (or default) value.  After a
+    /// successful mount, it is updated to the server-negotiated value.
+    ///
+    /// - Throws: `POSIXError(.ENOTCONN)` if the context has been destroyed.
+    /// - Returns: Maximum read payload in bytes.
+    func getReadMax() throws -> Int {
         try queue.sync {
             let ctx = try context.unwrap()
-            nfs_set_readahead(ctx, bytes)
-        }
-    }
-
-    func setPageCache(pages: UInt32, ttl: UInt32 = 30) throws {
-        try queue.sync {
-            let ctx = try context.unwrap()
-            nfs_set_pagecache(ctx, pages)
-            nfs_set_pagecache_ttl(ctx, ttl)
+            return Int(nfs_get_readmax(ctx))
         }
     }
 
@@ -1396,6 +1595,96 @@ final class NFSEventLoop: @unchecked Sendable {
         }
     }
 
+    /// Set the maximum write size libnfs will use for a single RPC write call.
+    ///
+    /// Call before ``mount(server:export:)`` — the value is applied during
+    /// mount negotiation.
+    ///
+    /// - Parameter bytes: Maximum write payload in bytes (e.g. 2_097_152 for 2 MB).
+    func setWriteMax(_ bytes: Int) throws {
+        try queue.sync {
+            let ctx = try context.unwrap()
+            nfs_set_writemax(ctx, bytes)
+        }
+    }
+
+    /// Set the number of RPC retransmissions before an operation is considered
+    /// failed.
+    ///
+    /// - Parameter count: Number of retransmissions (e.g. 3).
+    func setRetransmissions(_ count: Int32) throws {
+        try queue.sync {
+            let ctx = try context.unwrap()
+            nfs_set_retrans(ctx, count)
+        }
+    }
+
+    /// Set the log verbosity level.
+    ///
+    /// Controls how much detail libnfs emits through the log callback registered
+    /// via ``setLogHandler(_:)``. Common values: 0 = off, 1 = errors, 2 = info,
+    /// 3 = debug, 4 = trace (libnfs-defined; see `nfs_set_debug` docs).
+    ///
+    /// - Parameter level: Verbosity level passed to `nfs_set_debug`.
+    func setDebugLevel(_ level: Int32) throws {
+        try queue.sync {
+            let ctx = try context.unwrap()
+            nfs_set_debug(ctx, level)
+        }
+    }
+
+    /// Register a Swift closure that receives libnfs log messages.
+    ///
+    /// The handler is called on the event-loop's serial queue (inside
+    /// `nfs_service`) and must not block. It receives the libnfs log level
+    /// integer and the message string.
+    ///
+    /// Pass `nil` to remove any previously installed handler.
+    ///
+    /// - Parameter handler: A `@Sendable` closure `(level: Int, message: String) -> Void`,
+    ///   or `nil` to deregister.
+    func setLogHandler(_ handler: (@Sendable (Int, String) -> Void)?) {
+        queue.sync {
+            // Release the previous box, if any.
+            if let oldPtr = logHandlerBoxPtr {
+                Unmanaged<LogHandlerBox>.fromOpaque(oldPtr).release()
+                logHandlerBoxPtr = nil
+            }
+
+            guard let ctx = context, let handler = handler else {
+                // If ctx is nil we still cleared the old handler above; nothing more to do.
+                // If handler is nil the caller wants deregistration — done.
+                if let ctx = context {
+                    let rpc = nfs_get_rpc_context(ctx)
+                    rpc_set_log_cb(rpc, nil, nil)
+                }
+                return
+            }
+
+            let box = LogHandlerBox(handler)
+            // passRetained: we hold the +1 ref until the registration is replaced or removed.
+            let boxPtr = Unmanaged.passRetained(box).toOpaque()
+            logHandlerBoxPtr = boxPtr
+
+            let rpc = nfs_get_rpc_context(ctx)
+            rpc_set_log_cb(rpc, NFSEventLoop.logCallback, boxPtr)
+        }
+    }
+
+    /// Set the RPC timeout in milliseconds.
+    ///
+    /// When using the async interface, pairing this with a `DispatchSource`
+    /// timer is recommended for proper timeout enforcement — see the libnfs
+    /// documentation for `nfs_set_timeout`.
+    ///
+    /// - Parameter milliseconds: Timeout duration (e.g. 5000 for 5 seconds).
+    func setTimeout(_ milliseconds: Int32) throws {
+        try queue.sync {
+            let ctx = try context.unwrap()
+            nfs_set_timeout(ctx, milliseconds)
+        }
+    }
+
     func setUID(_ uid: Int32) throws {
         try queue.sync {
             let ctx = try context.unwrap()
@@ -1407,6 +1696,69 @@ final class NFSEventLoop: @unchecked Sendable {
         try queue.sync {
             let ctx = try context.unwrap()
             nfs_set_gid(ctx, gid)
+        }
+    }
+
+    /// Set the NFS authentication security mode.
+    ///
+    /// Must be called **before** ``mount(server:export:)`` — libnfs
+    /// consults the security setting during mount negotiation. Calling
+    /// this method after the connection is established (file descriptor
+    /// is open) throws ``POSIXError`` with code `.EISCONN`.
+    ///
+    /// - Parameter security: The desired ``NFSSecurity`` mode.
+    /// - Throws: `POSIXError(.ENOTCONN)` if the context has been destroyed,
+    ///           `POSIXError(.EISCONN)` if already connected.
+    func setSecurity(_ security: NFSSecurity) throws {
+        try queue.sync {
+            let ctx = try context.unwrap()
+            guard nfs_get_fd(ctx) < 0 else {
+                throw POSIXError(.EISCONN, description: "Cannot change security mode while connected")
+            }
+            nfs_set_security(ctx, security.rpcSecValue)
+        }
+    }
+
+    // MARK: - Diagnostics
+
+    /// Returns a point-in-time snapshot of the RPC transport statistics.
+    ///
+    /// Dispatches synchronously on the serial queue to safely access the
+    /// `nfs_context*` and call `rpc_get_stats`. All counters are cumulative
+    /// since the context was created.
+    ///
+    /// - Throws: `POSIXError(.ENOTCONN)` if the context has been shut down.
+    /// - Returns: An ``NFSStats`` populated from `struct rpc_stats`.
+    func stats() throws -> NFSStats {
+        try queue.sync {
+            let ctx = try context.unwrap()
+            let rpc = nfs_get_rpc_context(ctx)
+            var cStats = rpc_stats()
+            rpc_get_stats(rpc, &cStats)
+            return NFSStats(
+                requestsSent: cStats.num_req_sent,
+                responsesReceived: cStats.num_resp_rcvd,
+                timedOut: cStats.num_timedout,
+                timedOutInOutqueue: cStats.num_timedout_in_outqueue,
+                majorTimedOut: cStats.num_major_timedout,
+                retransmitted: cStats.num_retransmitted,
+                reconnects: cStats.num_reconnects
+            )
+        }
+    }
+
+    /// Returns the server address this context is (or was) connected to.
+    ///
+    /// Dispatches synchronously on the serial queue. Before a successful
+    /// ``mount(server:export:)``, libnfs returns NULL and this method returns `nil`.
+    ///
+    /// - Throws: `POSIXError(.ENOTCONN)` if the context has been shut down.
+    /// - Returns: A copy of `sockaddr_storage`, or `nil` if not yet connected.
+    func serverAddress() throws -> sockaddr_storage? {
+        try queue.sync {
+            let ctx = try context.unwrap()
+            guard let ptr = nfs_get_server_address(ctx) else { return nil }
+            return ptr.pointee
         }
     }
 }

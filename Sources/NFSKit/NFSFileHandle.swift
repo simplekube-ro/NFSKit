@@ -54,6 +54,32 @@ public final class NFSFileHandle: Sendable {
         try await eventLoop.preadFile(handleID: handleID, offset: offset, count: count)
     }
 
+    /// Positional read into a caller-owned buffer.
+    ///
+    /// Writes directly into `buffer` at the address provided, avoiding an extra
+    /// allocation. Used internally by the pre-allocated buffer path in
+    /// ``NFSClient.contents(atPath:)``.
+    ///
+    /// The caller must ensure `buffer` remains valid until the returned task completes.
+    ///
+    /// - Parameters:
+    ///   - buffer: Pointer to the destination memory region (at least `count` bytes).
+    ///   - offset: Byte offset within the file to start reading from.
+    ///   - count: Number of bytes to request.
+    /// - Returns: The number of bytes actually written into `buffer` (`<= count`).
+    func preadIntoBuffer(
+        buffer: UnsafeMutableRawPointer,
+        offset: UInt64,
+        count: UInt64
+    ) async throws -> Int {
+        try await eventLoop.preadIntoBuffer(
+            handleID: handleID,
+            buffer: buffer,
+            offset: offset,
+            count: count
+        )
+    }
+
     // MARK: - Write
 
     /// Write `data` at the current file position.

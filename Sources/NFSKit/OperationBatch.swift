@@ -50,13 +50,32 @@ final class OperationBatch {
     /// Chunk indices that have been issued but have not yet received a callback.
     private(set) var inFlightChunkIndices: Set<Int>
 
-    /// Completed chunk data keyed by chunk index for ordered reassembly.
+    /// Completed chunk data keyed by chunk index for ordered reassembly (legacy mode only).
     private var completedChunks: [Int: Data] = [:]
 
     /// The total number of chunks in this batch.
     private let totalChunks: Int
 
-    /// Creates a new operation batch.
+    // MARK: - Buffer-Slice Mode State
+
+    /// The pre-allocated buffer into which libnfs writes directly (buffer-slice mode only).
+    /// `nil` in legacy per-chunk mode.
+    private let sliceBuffer: ReadBuffer?
+
+    /// The size of each chunk written to the buffer, used to compute destination offsets
+    /// for callers issuing pread calls (buffer-slice mode only).
+    private let sliceChunkSize: Int
+
+    /// Tracks actual bytes written per slice index, accounting for short reads at EOF
+    /// (buffer-slice mode only).
+    private var completedSliceByteCounts: [Int: Int] = [:]
+
+    // MARK: - Initialisers
+
+    /// Creates a new operation batch in legacy per-chunk mode.
+    ///
+    /// Each chunk delivers its own `Data` value to ``recordChunkCompletion(index:data:)``.
+    /// ``assembleData()`` concatenates them in index order.
     ///
     /// - Parameters:
     ///   - batchID: The unique identifier for this batch.
@@ -65,6 +84,33 @@ final class OperationBatch {
     init(batchID: BatchID, totalChunks: Int) {
         self.batchID = batchID
         self.totalChunks = totalChunks
+        self.sliceBuffer = nil
+        self.sliceChunkSize = 0
+        self.pendingChunkIndices = Array(0..<totalChunks)
+        self.inFlightChunkIndices = []
+    }
+
+    /// Creates a new operation batch in buffer-slice mode.
+    ///
+    /// In this mode, all chunks write directly into `buffer` at pre-computed
+    /// offsets (`chunkIndex * chunkSize`). Callers use
+    /// ``recordSliceCompletion(index:bytesWritten:)`` instead of
+    /// ``recordChunkCompletion(index:data:)``.  ``assembleData()`` returns a
+    /// zero-copy `Data` wrapping the buffer.
+    ///
+    /// - Parameters:
+    ///   - batchID: The unique identifier for this batch.
+    ///   - totalChunks: The number of chunks (slices) in the batch.
+    ///   - buffer: The pre-allocated buffer. Its size must be at least
+    ///     `totalChunks * chunkSize` bytes.  Ownership transfers to `Data`
+    ///     on a successful ``assembleData()`` call.
+    ///   - chunkSize: The byte size of each chunk used when issuing pread calls.
+    ///     The last chunk may write fewer bytes (short read at EOF).
+    init(batchID: BatchID, totalChunks: Int, buffer: ReadBuffer, chunkSize: Int) {
+        self.batchID = batchID
+        self.totalChunks = totalChunks
+        self.sliceBuffer = buffer
+        self.sliceChunkSize = chunkSize
         self.pendingChunkIndices = Array(0..<totalChunks)
         self.inFlightChunkIndices = []
     }
@@ -82,7 +128,7 @@ final class OperationBatch {
         return index
     }
 
-    /// Records a successful chunk completion with its data.
+    /// Records a successful chunk completion with its data (legacy per-chunk mode).
     ///
     /// If the batch has been cancelled, the data is silently discarded.
     ///
@@ -95,19 +141,63 @@ final class OperationBatch {
         completedChunks[index] = data
     }
 
+    /// Records a successful slice completion in buffer-slice mode.
+    ///
+    /// The slice's bytes have already been written to the shared buffer at offset
+    /// `index * chunkSize` by the pread callback. This method records the actual
+    /// byte count (which may be less than `chunkSize` for the last slice at EOF).
+    ///
+    /// If the batch has been cancelled, the record is silently discarded.
+    ///
+    /// - Parameters:
+    ///   - index: The chunk/slice index that completed.
+    ///   - bytesWritten: The number of bytes actually written into the buffer for
+    ///     this slice. Must be `<= chunkSize`.
+    func recordSliceCompletion(index: Int, bytesWritten: Int) {
+        guard case .active = state else { return }
+        inFlightChunkIndices.remove(index)
+        completedSliceByteCounts[index] = bytesWritten
+    }
+
     /// Whether all chunks in the batch have completed successfully.
     ///
     /// Returns `false` if the batch is cancelled or completed.
     var isComplete: Bool {
         guard case .active = state else { return false }
+        if sliceBuffer != nil {
+            return completedSliceByteCounts.count == totalChunks
+        }
         return completedChunks.count == totalChunks
     }
 
-    /// Assembles all completed chunk data in chunk-index order.
+    /// Assembles all completed data.
     ///
-    /// - Returns: The concatenated data from all chunks, ordered by index.
-    ///   If some chunks are missing, only the available chunks contribute.
+    /// **Legacy mode**: concatenates completed chunk `Data` values in index order.
+    ///
+    /// **Buffer-slice mode**: returns a zero-copy `Data` wrapping the pre-allocated
+    /// buffer. The slice-byte-count array is summed to determine the valid length
+    /// (accounting for a short final read). After this call the buffer is
+    /// *disowned* — its memory is managed by the returned `Data`'s deallocator.
+    ///
+    /// - Returns: The assembled file data.
     func assembleData() -> Data {
+        if let buffer = sliceBuffer {
+            // Sum actual bytes written across all slices to handle a short final read.
+            var totalBytesWritten = 0
+            for index in 0..<totalChunks {
+                totalBytesWritten += completedSliceByteCounts[index, default: 0]
+            }
+            // Transfer buffer ownership to Data. The pointer will be freed via the
+            // custom deallocator when the Data value is released.
+            buffer.disown()
+            return Data(
+                bytesNoCopy: buffer.pointer,
+                count: totalBytesWritten,
+                deallocator: .custom { ptr, _ in ptr.deallocate() }
+            )
+        }
+
+        // Legacy mode: concatenate chunks in index order.
         var result = Data()
         for index in 0..<totalChunks {
             if let chunk = completedChunks[index] {

@@ -255,4 +255,148 @@ final class OperationBatchTests: XCTestCase {
             XCTFail("State should be .completed after markCompleted(), got \(batch.state)")
         }
     }
+
+    // MARK: - Buffer-Slice Mode
+
+    func testBufferModeCreation() {
+        let buffer = ReadBuffer(byteCount: 1024)
+        let batch = OperationBatch(batchID: BatchID(value: 10), totalChunks: 4, buffer: buffer, chunkSize: 256)
+
+        XCTAssertEqual(batch.batchID, BatchID(value: 10))
+
+        switch batch.state {
+        case .active:
+            break // expected
+        default:
+            XCTFail("New buffer-mode batch should be in .active state, got \(batch.state)")
+        }
+
+        // Buffer mode still uses the standard pending/in-flight machinery.
+        XCTAssertEqual(batch.pendingChunkIndices, [0, 1, 2, 3])
+        XCTAssertTrue(batch.inFlightChunkIndices.isEmpty)
+        XCTAssertFalse(batch.isComplete)
+        XCTAssertFalse(batch.isCancelled)
+    }
+
+    func testBufferModeRecordSliceCompletion() {
+        let totalBytes = 1024
+        let chunkSize = 256
+        let totalChunks = 4
+        let buffer = ReadBuffer(byteCount: totalBytes)
+        let batch = OperationBatch(
+            batchID: BatchID(value: 11),
+            totalChunks: totalChunks,
+            buffer: buffer,
+            chunkSize: chunkSize
+        )
+
+        // Dequeue and complete all slices.
+        for chunkIndex in 0..<totalChunks {
+            let dequeued = batch.dequeueNextChunk()
+            XCTAssertEqual(dequeued, chunkIndex)
+            // Simulate a full-sized slice completing.
+            batch.recordSliceCompletion(index: chunkIndex, bytesWritten: chunkSize)
+        }
+
+        XCTAssertTrue(batch.isComplete, "Batch should be complete when all slices are recorded")
+    }
+
+    func testBufferModeIsCompleteReturnsFalseWithPartialSlices() {
+        let buffer = ReadBuffer(byteCount: 1024)
+        let batch = OperationBatch(
+            batchID: BatchID(value: 12),
+            totalChunks: 4,
+            buffer: buffer,
+            chunkSize: 256
+        )
+
+        _ = batch.dequeueNextChunk()
+        batch.recordSliceCompletion(index: 0, bytesWritten: 256)
+        _ = batch.dequeueNextChunk()
+        batch.recordSliceCompletion(index: 1, bytesWritten: 256)
+
+        XCTAssertFalse(batch.isComplete, "Batch should not be complete with two slices still pending")
+    }
+
+    func testBufferModeAssembleData() {
+        // Write known bytes into a buffer across two slices,
+        // then verify assembleData() wraps exactly those bytes.
+        let chunkSize = 4
+        let totalChunks = 2
+        let buffer = ReadBuffer(byteCount: chunkSize * totalChunks)
+
+        // Write test data directly into the buffer memory.
+        let rawPtr = buffer.pointer
+        rawPtr.storeBytes(of: UInt8(0xAA), toByteOffset: 0, as: UInt8.self)
+        rawPtr.storeBytes(of: UInt8(0xBB), toByteOffset: 1, as: UInt8.self)
+        rawPtr.storeBytes(of: UInt8(0xCC), toByteOffset: 2, as: UInt8.self)
+        rawPtr.storeBytes(of: UInt8(0xDD), toByteOffset: 3, as: UInt8.self)
+        rawPtr.storeBytes(of: UInt8(0x11), toByteOffset: 4, as: UInt8.self)
+        rawPtr.storeBytes(of: UInt8(0x22), toByteOffset: 5, as: UInt8.self)
+        rawPtr.storeBytes(of: UInt8(0x33), toByteOffset: 6, as: UInt8.self)
+        rawPtr.storeBytes(of: UInt8(0x44), toByteOffset: 7, as: UInt8.self)
+
+        let batch = OperationBatch(
+            batchID: BatchID(value: 13),
+            totalChunks: totalChunks,
+            buffer: buffer,
+            chunkSize: chunkSize
+        )
+
+        _ = batch.dequeueNextChunk()
+        batch.recordSliceCompletion(index: 0, bytesWritten: 4)
+        _ = batch.dequeueNextChunk()
+        // Simulate the last slice returning only 3 bytes (short read at EOF).
+        batch.recordSliceCompletion(index: 1, bytesWritten: 3)
+
+        XCTAssertTrue(batch.isComplete)
+
+        let assembled = batch.assembleData()
+
+        // Total bytes = 4 + 3 = 7; buffer ownership should transfer.
+        XCTAssertEqual(assembled.count, 7, "assembleData should return exactly totalBytesWritten bytes")
+        XCTAssertEqual(assembled[0], 0xAA)
+        XCTAssertEqual(assembled[1], 0xBB)
+        XCTAssertEqual(assembled[2], 0xCC)
+        XCTAssertEqual(assembled[3], 0xDD)
+        XCTAssertEqual(assembled[4], 0x11)
+        XCTAssertEqual(assembled[5], 0x22)
+        XCTAssertEqual(assembled[6], 0x33)
+
+        // After assembleData(), the buffer has been disowned; it must not free on deinit.
+        XCTAssertFalse(buffer.isOwned, "Buffer should be disowned after assembleData()")
+    }
+
+    func testBufferModeAssembleDataDiscardsOnCancel() {
+        let buffer = ReadBuffer(byteCount: 512)
+        let batch = OperationBatch(
+            batchID: BatchID(value: 14),
+            totalChunks: 2,
+            buffer: buffer,
+            chunkSize: 256
+        )
+
+        _ = batch.dequeueNextChunk()
+        batch.cancel(reason: POSIXError(.ECANCELED))
+
+        // Cancellation after a slice was in-flight; buffer is still owned (not disowned).
+        XCTAssertTrue(batch.isCancelled)
+        XCTAssertTrue(buffer.isOwned, "Buffer should remain owned (and be freed by deinit) when cancelled")
+    }
+
+    func testLegacyModeStillWorks() {
+        // Verify existing per-chunk Data mode is unaffected by the new buffer-slice mode.
+        let batch = OperationBatch(batchID: BatchID(value: 99), totalChunks: 3)
+
+        let idx0 = batch.dequeueNextChunk()!
+        let idx1 = batch.dequeueNextChunk()!
+        let idx2 = batch.dequeueNextChunk()!
+
+        batch.recordChunkCompletion(index: idx0, data: Data([0x01, 0x02]))
+        batch.recordChunkCompletion(index: idx1, data: Data([0x03, 0x04]))
+        batch.recordChunkCompletion(index: idx2, data: Data([0x05, 0x06]))
+
+        XCTAssertTrue(batch.isComplete)
+        XCTAssertEqual(batch.assembleData(), Data([0x01, 0x02, 0x03, 0x04, 0x05, 0x06]))
+    }
 }

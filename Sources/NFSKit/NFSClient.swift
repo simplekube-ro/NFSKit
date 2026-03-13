@@ -95,7 +95,34 @@ extension NFSClient {
 @available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, macCatalyst 13.0, *)
 extension NFSClient {
 
+    /// Maximum file size (bytes) for the pre-allocated single-buffer read path.
+    ///
+    /// Files up to this size are read into a single allocation in one pass of
+    /// pipelined pread calls, then wrapped with `Data(bytesNoCopy:)` for zero-copy
+    /// delivery.  Files larger than this threshold fall back to the sequential
+    /// chunked read path, which bounds peak memory usage.
+    ///
+    /// 64 MB is a conservative default that keeps peak RSS manageable on iOS while
+    /// still benefiting most media and document transfers.
+    static let contentsBufferThreshold: Int = 67_108_864 // 64 MB
+
+    /// Returns whether the pre-allocated single-buffer path should be used for
+    /// a file of the given size.
+    ///
+    /// Exposed as a static helper so unit tests can verify the threshold logic
+    /// without a live NFS connection.
+    static func shouldUsePreallocatedBuffer(fileSize: Int64) -> Bool {
+        fileSize > 0 && fileSize <= Int64(contentsBufferThreshold)
+    }
+
     /// Read the entire contents of a file.
+    ///
+    /// For files up to 64 MB, this method allocates a single buffer upfront and
+    /// issues pipelined `pread` calls that write directly into it, then wraps the
+    /// buffer in a `Data(bytesNoCopy:)` value for zero-copy delivery.
+    ///
+    /// For files larger than 64 MB the legacy sequential chunked read is used to
+    /// bound peak memory usage.
     ///
     /// - Parameters:
     ///   - path: The file path on the NFS share.
@@ -112,6 +139,104 @@ extension NFSClient {
         let stat = try await handle.fstat()
         let fileSize = Int64(stat.nfs_size)
 
+        // Empty file — no I/O needed.
+        guard fileSize > 0 else { return Data() }
+
+        if NFSClient.shouldUsePreallocatedBuffer(fileSize: fileSize) {
+            return try await contentsUsingPreallocatedBuffer(
+                handle: handle,
+                fileSize: fileSize,
+                progress: progress
+            )
+        } else {
+            return try await contentsUsingLegacyChunkedRead(
+                handle: handle,
+                fileSize: fileSize,
+                progress: progress
+            )
+        }
+    }
+
+    /// Reads a file whose size fits within the pre-allocated buffer threshold.
+    ///
+    /// Allocates a single `ReadBuffer`, then issues `pread` calls in pipeline order
+    /// — each writing directly into the buffer at `chunkIndex * chunkSize`.  When
+    /// all reads complete, wraps the buffer in `Data(bytesNoCopy:)`.
+    private func contentsUsingPreallocatedBuffer(
+        handle: NFSFileHandle,
+        fileSize: Int64,
+        progress: (@Sendable (Int64, Int64) -> Bool)?
+    ) async throws -> Data {
+        let chunkSize = try eventLoop.getReadMax()
+        let totalBytes = Int(fileSize)
+        let totalChunks = (totalBytes + chunkSize - 1) / chunkSize
+
+        let buffer = ReadBuffer(byteCount: totalBytes)
+
+        // Issue all pread calls in parallel (pipelined).  Each chunk writes into
+        // a distinct, non-overlapping region of `buffer`.
+        try await withThrowingTaskGroup(of: (Int, Int).self) { group in
+            for chunkIndex in 0..<totalChunks {
+                try Task.checkCancellation()
+                let byteOffset = chunkIndex * chunkSize
+                let remaining = totalBytes - byteOffset
+                let readCount = min(chunkSize, remaining)
+                let slicePtr = buffer.pointer.advanced(by: byteOffset)
+
+                group.addTask {
+                    let bytesRead = try await handle.preadIntoBuffer(
+                        buffer: slicePtr,
+                        offset: UInt64(byteOffset),
+                        count: UInt64(readCount)
+                    )
+                    return (chunkIndex, bytesRead)
+                }
+            }
+
+            // Drain results; they may arrive out of order but each writes to its
+            // own non-overlapping slice so ordering doesn't matter here.
+            var totalBytesRead = 0
+            var cancelledByProgress = false
+            for try await (_, bytesRead) in group {
+                totalBytesRead += bytesRead
+                if !cancelledByProgress,
+                   let progress = progress,
+                   !progress(Int64(totalBytesRead), fileSize) {
+                    cancelledByProgress = true
+                    group.cancelAll()
+                    // Drain remaining in-flight tasks before throwing.
+                    // preadIntoBuffer continuations hold raw pointers into
+                    // `buffer`; we must not deallocate `buffer` while libnfs
+                    // still holds those pointers.  withThrowingTaskGroup awaits
+                    // all child tasks before propagating a throw from the body,
+                    // but since we are throwing after the for-await loop exits
+                    // we make the drain explicit to be safe.
+                    do {
+                        for try await _ in group { }
+                    } catch { }
+                }
+            }
+            if cancelledByProgress {
+                throw POSIXError(.ECANCELED, description: "Cancelled by progress handler")
+            }
+        }
+
+        // Transfer buffer ownership to Data.  The pointer will be freed by the
+        // custom deallocator when the last Data reference is released.
+        buffer.disown()
+        return Data(
+            bytesNoCopy: buffer.pointer,
+            count: totalBytes,
+            deallocator: .custom { ptr, _ in ptr.deallocate() }
+        )
+    }
+
+    /// Sequential chunked read — used for files larger than the pre-allocated buffer threshold.
+    private func contentsUsingLegacyChunkedRead(
+        handle: NFSFileHandle,
+        fileSize: Int64,
+        progress: (@Sendable (Int64, Int64) -> Bool)?
+    ) async throws -> Data {
         var data = Data()
         data.reserveCapacity(Int(fileSize))
         var offset: Int64 = 0
@@ -304,22 +429,65 @@ extension NFSClient {
     ///
     /// - Parameters:
     ///   - readMax: Override server-negotiated maximum read size in bytes.
-    ///   - readAhead: Number of bytes to read ahead.
-    ///   - pageCachePages: Number of page-cache pages.
-    ///   - pageCacheTTL: Page-cache TTL in seconds (default 30).
+    ///   - writeMax: Override server-negotiated maximum write size in bytes.
     ///   - autoReconnect: Number of reconnect retries (-1 for infinite, 0 to disable).
+    ///   - retransmissions: Number of RPC retransmissions before a failure is declared.
+    ///   - timeout: RPC timeout in milliseconds.
     public func configurePerformance(
-        readMax: UInt64? = nil,
-        readAhead: UInt32? = nil,
-        pageCachePages: UInt32? = nil,
-        pageCacheTTL: UInt32? = nil,
-        autoReconnect: Int32? = nil
+        readMax: Int? = nil,
+        writeMax: Int? = nil,
+        autoReconnect: Int32? = nil,
+        retransmissions: Int32? = nil,
+        timeout: Int32? = nil
     ) {
         if let readMax = readMax { try? eventLoop.setReadMax(readMax) }
-        if let readAhead = readAhead { try? eventLoop.setReadAhead(readAhead) }
-        if let pages = pageCachePages {
-            try? eventLoop.setPageCache(pages: pages, ttl: pageCacheTTL ?? 30)
-        }
+        if let writeMax = writeMax { try? eventLoop.setWriteMax(writeMax) }
         if let retries = autoReconnect { try? eventLoop.setAutoReconnect(retries) }
+        if let count = retransmissions { try? eventLoop.setRetransmissions(count) }
+        if let milliseconds = timeout { try? eventLoop.setTimeout(milliseconds) }
+    }
+
+    /// Set the NFS authentication security mode.
+    ///
+    /// Must be called **before** ``connect(export:)`` — libnfs reads the
+    /// security setting during mount negotiation. If called after the
+    /// underlying connection is open the call is silently ignored; use
+    /// ``NFSEventLoop/setSecurity(_:)`` directly if you need to detect
+    /// that case.
+    ///
+    /// - Parameter security: The desired ``NFSSecurity`` mode.
+    public func setSecurity(_ security: NFSSecurity) {
+        try? eventLoop.setSecurity(security)
+    }
+
+}
+
+// MARK: - Diagnostics
+
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, macCatalyst 13.0, *)
+extension NFSClient {
+
+    /// Returns a point-in-time snapshot of RPC transport statistics.
+    ///
+    /// The counters are cumulative since the underlying `nfs_context` was
+    /// created. Call repeatedly to compute deltas between samples.
+    ///
+    /// - Throws: `POSIXError(.ENOTCONN)` if the client has been disconnected.
+    /// - Returns: An ``NFSStats`` with the current counter values.
+    public func stats() async throws -> NFSStats {
+        // stats() dispatches synchronously on the serial queue internally,
+        // so calling it directly from an async context is safe.
+        try eventLoop.stats()
+    }
+
+    /// Returns the NFS server address the client is (or was) connected to.
+    ///
+    /// Before a successful ``connect(export:)``, libnfs has no server address
+    /// recorded and this method returns `nil`.
+    ///
+    /// - Throws: `POSIXError(.ENOTCONN)` if the client has been disconnected.
+    /// - Returns: A `sockaddr_storage` copy, or `nil` if not yet connected.
+    public func serverAddress() async throws -> sockaddr_storage? {
+        try eventLoop.serverAddress()
     }
 }

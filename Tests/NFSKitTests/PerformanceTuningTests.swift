@@ -40,36 +40,6 @@ final class NFSContextPerformanceTuningTests: XCTestCase {
         XCTAssertNoThrow(try ctx.setReadMax(0))
     }
 
-    // MARK: - setReadAhead
-
-    func testSetReadAheadDoesNotThrow() throws {
-        let ctx = try XCTUnwrap(ctx)
-        XCTAssertNoThrow(try ctx.setReadAhead(4096))
-    }
-
-    func testSetReadAheadZeroDisables() throws {
-        let ctx = try XCTUnwrap(ctx)
-        XCTAssertNoThrow(try ctx.setReadAhead(0))
-    }
-
-    // MARK: - setPageCache
-
-    func testSetPageCacheDoesNotThrow() throws {
-        let ctx = try XCTUnwrap(ctx)
-        XCTAssertNoThrow(try ctx.setPageCache(pages: 256, ttl: 60))
-    }
-
-    func testSetPageCacheDefaultTTL() throws {
-        let ctx = try XCTUnwrap(ctx)
-        // Uses the default ttl = 30 when not specified
-        XCTAssertNoThrow(try ctx.setPageCache(pages: 128))
-    }
-
-    func testSetPageCacheZeroPagesDisables() throws {
-        let ctx = try XCTUnwrap(ctx)
-        XCTAssertNoThrow(try ctx.setPageCache(pages: 0))
-    }
-
     // MARK: - setAutoReconnect
 
     func testSetAutoReconnectPositive() throws {
@@ -112,10 +82,38 @@ final class NFSContextPerformanceTuningTests: XCTestCase {
     func testMultipleSettingsCanBeAppliedSequentially() throws {
         let ctx = try XCTUnwrap(ctx)
         XCTAssertNoThrow(try ctx.setReadMax(2_097_152))
-        XCTAssertNoThrow(try ctx.setReadAhead(8192))
-        XCTAssertNoThrow(try ctx.setPageCache(pages: 512, ttl: 120))
         XCTAssertNoThrow(try ctx.setAutoReconnect(3))
         XCTAssertNoThrow(try ctx.setVersion(3))
+    }
+}
+
+// MARK: - NFSEventLoop extended performance tuning (libnfs 6.x)
+
+@available(macOS 10.15, iOS 13.0, tvOS 13.0, watchOS 6.0, macCatalyst 13.0, *)
+final class NFSEventLoopPerformanceTuningTests: XCTestCase {
+
+    private var eventLoop: NFSEventLoop!
+
+    override func setUpWithError() throws {
+        try super.setUpWithError()
+        eventLoop = try NFSEventLoop(timeout: 10)
+    }
+
+    override func tearDown() {
+        eventLoop = nil
+        super.tearDown()
+    }
+
+    func testSetWriteMaxDoesNotThrow() throws {
+        XCTAssertNoThrow(try eventLoop.setWriteMax(2_097_152))  // 2 MB
+    }
+
+    func testSetRetransmissionsDoesNotThrow() throws {
+        XCTAssertNoThrow(try eventLoop.setRetransmissions(3))
+    }
+
+    func testSetTimeoutDoesNotThrow() throws {
+        XCTAssertNoThrow(try eventLoop.setTimeout(5000))         // 5 seconds
     }
 }
 
@@ -141,10 +139,17 @@ final class NFSClientPerformanceTuningTests: XCTestCase {
         // Should work without errors pre-connect
         client.configurePerformance(
             readMax: 1_048_576,
-            readAhead: 4096,
-            pageCachePages: 256,
-            pageCacheTTL: 60,
             autoReconnect: -1
+        )
+    }
+
+    func testConfigurePerformanceWithNewParams() throws {
+        let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
+        // All three new parameters should be accepted without crashing
+        client.configurePerformance(
+            writeMax: 2_097_152,
+            retransmissions: 3,
+            timeout: 5000
         )
     }
 }
