@@ -45,6 +45,7 @@ final class NFSEventLoop: @unchecked Sendable {
     final class CallbackData: @unchecked Sendable {
         let continuationID: UInt64
         let operationCategory: OperationCategory
+        let startTime: DispatchTime
 
         /// Handler that extracts the result from the C callback parameters.
         /// Receives (status, data_pointer). For read: status > 0 is byte count.
@@ -69,6 +70,7 @@ final class NFSEventLoop: @unchecked Sendable {
         ) {
             self.continuationID = continuationID
             self.operationCategory = operationCategory
+            self.startTime = .now()
             self.dataHandler = dataHandler
             self._resume = resume
             self.completionHook = completionHook
@@ -89,6 +91,8 @@ final class NFSEventLoop: @unchecked Sendable {
     private var readSource: DispatchSourceRead?
     private var writeSource: DispatchSourceWrite?
     private var currentFd: Int32 = -1
+    private var currentSocketIno: UInt64 = 0
+    private var timeoutTimer: DispatchSourceTimer?
     private var writeSourceSuspended = true
     private var bulkController = PipelineController()
     private var metadataController = PipelineController()
@@ -138,6 +142,7 @@ final class NFSEventLoop: @unchecked Sendable {
 
         isRunning = false
         cancelSources()
+        cancelTimeoutTimer()
 
         let error = POSIXError(.ENOTCONN, description: "Event loop shut down")
 
@@ -177,6 +182,8 @@ final class NFSEventLoop: @unchecked Sendable {
     private func setupSources(fd: Int32) {
         cancelSources()
         currentFd = fd
+        currentSocketIno = Self.socketIno(fd)
+        startTimeoutTimer()
 
         let rs = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
         rs.setEventHandler { [weak self] in
@@ -195,6 +202,17 @@ final class NFSEventLoop: @unchecked Sendable {
         writeSource = ws
     }
 
+    /// Returns the inode of the socket underlying the given fd.
+    /// Used to detect fd reuse: when libnfs closes a socket and opens
+    /// a new one that gets the same fd number, kqueue silently removes
+    /// the old registration. Without re-creating DispatchSources, the
+    /// event loop would never fire again.
+    private static func socketIno(_ fd: Int32) -> UInt64 {
+        var sb = Darwin.stat()
+        guard Darwin.fstat(fd, &sb) == 0 else { return 0 }
+        return UInt64(bitPattern: Int64(sb.st_ino))
+    }
+
     private func cancelSources() {
         if let rs = readSource {
             rs.cancel()
@@ -209,6 +227,45 @@ final class NFSEventLoop: @unchecked Sendable {
             writeSource = nil
         }
         currentFd = -1
+        currentSocketIno = 0
+    }
+
+    // MARK: - Timeout Timer
+
+    /// Start a periodic timer that checks for timed-out operations.
+    /// The old poll()-based event loop had a Swift-level timeout; this
+    /// replicates it for the DispatchSource architecture.
+    private func startTimeoutTimer() {
+        guard timeoutTimer == nil, timeout > 0 else { return }
+        let timer = DispatchSource.makeTimerSource(queue: queue)
+        timer.schedule(deadline: .now() + 1, repeating: 1)
+        timer.setEventHandler { [weak self] in
+            self?.scanForTimeouts()
+        }
+        timer.resume()
+        timeoutTimer = timer
+    }
+
+    private func cancelTimeoutTimer() {
+        timeoutTimer?.cancel()
+        timeoutTimer = nil
+    }
+
+    private func scanForTimeouts() {
+        guard timeout > 0 else { return }
+        let deadline = DispatchTime.now() - timeout
+        var timedOut: [UInt64] = []
+        for (contID, cbData) in activeContinuations {
+            if cbData.startTime < deadline {
+                timedOut.append(contID)
+            }
+        }
+        for contID in timedOut {
+            if let cbData = activeContinuations.removeValue(forKey: contID) {
+                recordCompletion(category: cbData.operationCategory, success: false)
+                cbData.resume(.failure(POSIXError(.ETIMEDOUT)))
+            }
+        }
     }
 
     // MARK: - I/O Event Handling
@@ -223,9 +280,19 @@ final class NFSEventLoop: @unchecked Sendable {
             return
         }
 
+        // Detect socket changes — either a different fd number, or the same
+        // fd number backed by a different socket (fd reuse after close+reopen).
+        // libnfs closes and re-opens sockets during multi-step mount sequences
+        // (portmapper → mountd → nfsd). When the OS reuses the fd number,
+        // kqueue silently drops the old registration, so we must re-create
+        // DispatchSources to get events on the new socket.
         let newFd = nfs_get_fd(ctx)
-        if newFd != currentFd && newFd >= 0 {
-            setupSources(fd: newFd)
+        if newFd >= 0 {
+            if newFd != currentFd {
+                setupSources(fd: newFd)
+            } else if Self.socketIno(newFd) != currentSocketIno {
+                setupSources(fd: newFd)
+            }
         }
 
         updateWriteSource()
@@ -251,6 +318,7 @@ final class NFSEventLoop: @unchecked Sendable {
     private func shutdownWithError(_ error: Error) {
         isRunning = false
         cancelSources()
+        cancelTimeoutTimer()
 
         let continuations = activeContinuations
         activeContinuations.removeAll()
@@ -559,6 +627,12 @@ final class NFSEventLoop: @unchecked Sendable {
                     setupSources(fd: fd)
                     isRunning = true
                     updateWriteSource()
+                } else {
+                    // nfs_mount_async succeeded but no fd is available.
+                    // The timeout timer (started by setupSources on first
+                    // valid fd, or here as a fallback) will eventually
+                    // resume the continuation with ETIMEDOUT.
+                    startTimeoutTimer()
                 }
             }
         }
