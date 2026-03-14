@@ -17,14 +17,6 @@ extension Optional {
     }
 }
 
-extension Optional where Wrapped: NFSContext {
-     func unwrap() throws -> NFSContext {
-        guard let self = self, self.fileDescriptor >= 0 else {
-            throw POSIXError(.ENOTCONN, description: "NFS server not connected.")
-        }
-        return self
-    }
-}
 
 extension POSIXError {
     static func throwIfError<Number: SignedInteger>(_ result: Number, description: String?) throws {
@@ -42,7 +34,7 @@ extension POSIXError {
 
 extension POSIXErrorCode {
     init(_ code: Int32) {
-        self = POSIXErrorCode(rawValue: code) ?? .ECANCELED
+        self = POSIXErrorCode(rawValue: code) ?? .EIO
     }
 }
 
@@ -112,7 +104,7 @@ extension Array where Element == [URLResourceKey: Any] {
 
 extension Date {
     init(_ timespec: timespec) {
-        self.init(timeIntervalSince1970: TimeInterval(timespec.tv_sec) + TimeInterval(timespec.tv_nsec / 1000) / TimeInterval(USEC_PER_SEC))
+        self.init(timeIntervalSince1970: TimeInterval(timespec.tv_sec) + TimeInterval(timespec.tv_nsec) / 1_000_000_000.0)
     }
 }
 

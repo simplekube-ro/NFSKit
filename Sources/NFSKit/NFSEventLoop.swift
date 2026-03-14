@@ -60,20 +60,32 @@ final class NFSEventLoop: @unchecked Sendable {
 
         /// Guards against double-resume (e.g. callback fires during nfs_destroy_context
         /// after shutdown already resumed the continuation).
+        /// Thread safety: all `resume` calls execute on `NFSEventLoop.queue`, so this
+        /// non-atomic Bool is safe under queue confinement.
         private var hasResumed = false
 
         /// Called on the event loop queue after the callback fires.
         let completionHook: (_ success: Bool) -> Void
 
+        /// Optional cleanup closure invoked when the callback fires on *any* path
+        /// (success or error). Used to free heap-allocated buffers (e.g. writeBuf)
+        /// that would otherwise leak if the error path bypasses `dataHandler`.
+        var cleanup: (() -> Void)?
+
+        /// Queue reference for debug assertions.
+        private let queue: DispatchQueue
+
         init(
             continuationID: UInt64,
             operationCategory: OperationCategory = .metadata,
+            queue: DispatchQueue,
             dataHandler: @escaping (Int32, UnsafeMutableRawPointer?) -> Result<Any, Error>,
             resume: @escaping (Result<Any, Error>) -> Void,
             completionHook: @escaping (_ success: Bool) -> Void = { _ in }
         ) {
             self.continuationID = continuationID
             self.operationCategory = operationCategory
+            self.queue = queue
             self.startTime = .now()
             self.dataHandler = dataHandler
             self._resume = resume
@@ -81,7 +93,9 @@ final class NFSEventLoop: @unchecked Sendable {
         }
 
         /// Resume the continuation exactly once. Subsequent calls are no-ops.
+        /// All callers must be on the event loop queue.
         func resume(_ result: Result<Any, Error>) {
+            dispatchPrecondition(condition: .onQueue(queue))
             guard !hasResumed else { return }
             hasResumed = true
             _resume(result)
@@ -101,6 +115,7 @@ final class NFSEventLoop: @unchecked Sendable {
     private var bulkController = PipelineController()
     private var metadataController = PipelineController()
     private var pendingOperations: [PendingOperation] = []
+    private let maxPendingOperations: Int = 4096
     private var _inFlightCount: [OperationCategory: Int] = [.bulk: 0, .metadata: 0]
     private var handleRegistry: [UInt64: UnsafeMutablePointer<nfsfh>] = [:]
     private var nextHandleID: UInt64 = 1
@@ -552,6 +567,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: category,
+                    queue: queue,
                     dataHandler: { _, ptr in
                         do {
                             let result = try dataHandler(ptr)
@@ -563,7 +579,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            continuation.resume(returning: value as! T)
+                            if let typed = value as? T {
+                                continuation.resume(returning: typed)
+                            } else {
+                                continuation.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             continuation.resume(throwing: error)
                         }
@@ -580,6 +600,9 @@ final class NFSEventLoop: @unchecked Sendable {
 
                 if currentInFlight < controller.effectiveDepth {
                     issueOperation(ctx: ctx, contID: contID, cbData: cbData, type: type, execute: execute)
+                } else if pendingOperations.count >= maxPendingOperations {
+                    activeContinuations.removeValue(forKey: contID)
+                    continuation.resume(throwing: POSIXError(.ENOBUFS, description: "Pending operations queue at capacity (\(maxPendingOperations))"))
                 } else {
                     let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
                     let pending = PendingOperation(
@@ -620,6 +643,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: category,
+                    queue: queue,
                     dataHandler: { status, ptr in
                         do {
                             let result = try dataHandler(status, ptr)
@@ -631,7 +655,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            continuation.resume(returning: value as! T)
+                            if let typed = value as? T {
+                                continuation.resume(returning: typed)
+                            } else {
+                                continuation.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             continuation.resume(throwing: error)
                         }
@@ -648,6 +676,9 @@ final class NFSEventLoop: @unchecked Sendable {
 
                 if currentInFlight < controller.effectiveDepth {
                     issueOperation(ctx: ctx, contID: contID, cbData: cbData, type: type, execute: execute)
+                } else if pendingOperations.count >= maxPendingOperations {
+                    activeContinuations.removeValue(forKey: contID)
+                    continuation.resume(throwing: POSIXError(.ENOBUFS, description: "Pending operations queue at capacity (\(maxPendingOperations))"))
                 } else {
                     let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
                     let pending = PendingOperation(
@@ -706,6 +737,7 @@ final class NFSEventLoop: @unchecked Sendable {
         let cbData = Unmanaged<CallbackData>.fromOpaque(privateData).takeRetainedValue()
 
         if status < 0 {
+            cbData.cleanup?()
             cbData.completionHook(false)
             cbData.resume(.failure(POSIXError(.init(Int32(-status)))))
         } else {
@@ -773,6 +805,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .metadata,
+                    queue: queue,
                     dataHandler: { _, _ in .success(()) },
                     resume: { result in
                         switch result {
@@ -848,6 +881,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .metadata,
+                    queue: queue,
                     dataHandler: { _, data in
                         guard let data = data else { return .success([String]()) }
                         let result = data.assumingMemoryBound(to: exports.self).pointee
@@ -864,7 +898,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            continuation.resume(returning: value as! [String])
+                            if let typed = value as? [String] {
+                                continuation.resume(returning: typed)
+                            } else {
+                                continuation.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             continuation.resume(throwing: error)
                         }
@@ -1009,6 +1047,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .metadata,
+                    queue: queue,
                     dataHandler: { _, _ in .success(()) },
                     resume: { result in
                         switch result {
@@ -1064,6 +1103,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
+                    queue: queue,
                     dataHandler: { status, _ in
                         if status > 0 {
                             let byteCount = Int(status)
@@ -1082,7 +1122,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            cont.resume(returning: value as! Data)
+                            if let typed = value as? Data {
+                                cont.resume(returning: typed)
+                            } else {
+                                cont.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             cont.resume(throwing: error)
                         }
@@ -1091,6 +1135,7 @@ final class NFSEventLoop: @unchecked Sendable {
                         self?.handleCallbackCompletion(contID: contID, category: .bulk, success: success)
                     }
                 )
+                cbData.cleanup = { readBuf.deallocate() }
 
                 activeContinuations[contID] = cbData
 
@@ -1143,14 +1188,18 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
+                    queue: queue,
                     dataHandler: { status, _ in
-                        defer { writeBuf.deallocate() }
-                        return .success(Int(status))
+                        .success(Int(status))
                     },
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            cont.resume(returning: value as! Int)
+                            if let typed = value as? Int {
+                                cont.resume(returning: typed)
+                            } else {
+                                cont.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             cont.resume(throwing: error)
                         }
@@ -1159,6 +1208,7 @@ final class NFSEventLoop: @unchecked Sendable {
                         self?.handleCallbackCompletion(contID: contID, category: .bulk, success: success)
                     }
                 )
+                cbData.cleanup = { writeBuf.deallocate() }
 
                 activeContinuations[contID] = cbData
 
@@ -1200,6 +1250,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
+                    queue: queue,
                     dataHandler: { status, _ in
                         if status > 0 {
                             let byteCount = Int(status)
@@ -1215,7 +1266,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            cont.resume(returning: value as! Data)
+                            if let typed = value as? Data {
+                                cont.resume(returning: typed)
+                            } else {
+                                cont.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             cont.resume(throwing: error)
                         }
@@ -1224,6 +1279,7 @@ final class NFSEventLoop: @unchecked Sendable {
                         self?.handleCallbackCompletion(contID: contID, category: .bulk, success: success)
                     }
                 )
+                cbData.cleanup = { preadBuf.deallocate() }
 
                 activeContinuations[contID] = cbData
 
@@ -1295,6 +1351,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
+                    queue: queue,
                     dataHandler: { status, _ in
                         // status > 0: bytes written to destBuffer.
                         // status == 0: EOF (0 bytes read).
@@ -1304,7 +1361,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            cont.resume(returning: value as! Int)
+                            if let typed = value as? Int {
+                                cont.resume(returning: typed)
+                            } else {
+                                cont.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             cont.resume(throwing: error)
                         }
@@ -1364,14 +1425,18 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .bulk,
+                    queue: queue,
                     dataHandler: { status, _ in
-                        defer { writeBuf.deallocate() }
-                        return .success(Int(status))
+                        .success(Int(status))
                     },
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            cont.resume(returning: value as! Int)
+                            if let typed = value as? Int {
+                                cont.resume(returning: typed)
+                            } else {
+                                cont.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             cont.resume(throwing: error)
                         }
@@ -1380,6 +1445,7 @@ final class NFSEventLoop: @unchecked Sendable {
                         self?.handleCallbackCompletion(contID: contID, category: .bulk, success: success)
                     }
                 )
+                cbData.cleanup = { writeBuf.deallocate() }
 
                 activeContinuations[contID] = cbData
 
@@ -1418,6 +1484,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .metadata,
+                    queue: queue,
                     dataHandler: { _, _ in .success(()) },
                     resume: { result in
                         switch result {
@@ -1465,6 +1532,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .metadata,
+                    queue: queue,
                     dataHandler: { _, ptr in
                         guard let ptr = ptr else { return .failure(POSIXError(.ENODATA)) }
                         return .success(ptr.assumingMemoryBound(to: nfs_stat_64.self).pointee)
@@ -1472,7 +1540,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            cont.resume(returning: value as! nfs_stat_64)
+                            if let typed = value as? nfs_stat_64 {
+                                cont.resume(returning: typed)
+                            } else {
+                                cont.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             cont.resume(throwing: error)
                         }
@@ -1517,6 +1589,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .metadata,
+                    queue: queue,
                     dataHandler: { _, _ in .success(()) },
                     resume: { result in
                         switch result {
@@ -1564,6 +1637,7 @@ final class NFSEventLoop: @unchecked Sendable {
                 let cbData = CallbackData(
                     continuationID: contID,
                     operationCategory: .metadata,
+                    queue: queue,
                     dataHandler: { _, ptr in
                         guard let ptr = ptr else { return .success(UInt64(0)) }
                         return .success(ptr.assumingMemoryBound(to: UInt64.self).pointee)
@@ -1571,7 +1645,11 @@ final class NFSEventLoop: @unchecked Sendable {
                     resume: { result in
                         switch result {
                         case .success(let value):
-                            cont.resume(returning: value as! UInt64)
+                            if let typed = value as? UInt64 {
+                                cont.resume(returning: typed)
+                            } else {
+                                cont.resume(throwing: POSIXError(.EIO, description: "Internal type mismatch in callback"))
+                            }
                         case .failure(let error):
                             cont.resume(throwing: error)
                         }

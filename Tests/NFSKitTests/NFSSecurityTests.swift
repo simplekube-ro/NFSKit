@@ -98,7 +98,7 @@ final class NFSSecurityTests: XCTestCase {
             return
         }
         // Delegation is synchronous and does not throw pre-connect.
-        XCTAssertNoThrow(client.setSecurity(.kerberos5))
-        XCTAssertNoThrow(client.setSecurity(.system))
+        XCTAssertNoThrow(try client.setSecurity(.kerberos5))
+        XCTAssertNoThrow(try client.setSecurity(.system))
     }
 }
