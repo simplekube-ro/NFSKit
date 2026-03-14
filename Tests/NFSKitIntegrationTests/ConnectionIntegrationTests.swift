@@ -22,11 +22,30 @@ final class ConnectionIntegrationTests: XCTestCase {
 
     // MARK: - Export Discovery
 
-    // TODO: C5 — getexports hangs because mount_getexports_async opens its own
-    // RPC connection on a separate fd with no DispatchSource to drive it.
-    // Re-enable once the C5 fix lands (see NFSEventLoop.getexports TODO).
     func testListExports() async throws {
-        throw XCTSkip("Skipped: getexports has no event source (C5 bug)")
+        let client = try makeClient()
+        let exports = try await client.listExports()
+        XCTAssertFalse(exports.isEmpty, "Server should have at least one export")
+        XCTAssertTrue(exports.contains(Self.export), "Exports should contain \(Self.export)")
+    }
+
+    func testListExportsBeforeConnect() async throws {
+        let client = try makeClient()
+        // listExports should work without connecting first — it creates
+        // its own RPC connection to the mount service.
+        let exports = try await client.listExports()
+        XCTAssertFalse(exports.isEmpty, "Server should have at least one export")
+    }
+
+    func testListExportsThenConnect() async throws {
+        let client = try makeClient()
+        // Verify that listing exports does not corrupt the NFS context,
+        // so a subsequent mount still succeeds.
+        let exports = try await client.listExports()
+        XCTAssertFalse(exports.isEmpty)
+
+        try await client.connect(export: Self.export)
+        try await client.disconnect()
     }
 
     // MARK: - Connect / Disconnect

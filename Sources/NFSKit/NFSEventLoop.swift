@@ -109,6 +109,17 @@ final class NFSEventLoop: @unchecked Sendable {
     private var activeContinuations: [UInt64: CallbackData] = [:]
     private var nextContinuationID: UInt64 = 1
 
+    // MARK: - RPC Exports Context (getexports)
+
+    /// Separate RPC context for mount_getexports_async. Created per-call and
+    /// destroyed when the callback fires or on timeout/shutdown.
+    private var rpcExportsCtx: UnsafeMutablePointer<rpc_context>?
+    private var rpcExportsReadSource: DispatchSourceRead?
+    private var rpcExportsWriteSource: DispatchSourceWrite?
+    private var rpcExportsWriteSuspended = true
+    private var rpcExportsDone = false
+    private var rpcExportsContID: UInt64?
+
     // MARK: - Log Handler Support
 
     /// Box that holds a log handler closure on the heap.
@@ -166,6 +177,7 @@ final class NFSEventLoop: @unchecked Sendable {
 
         isRunning = false
         cancelSources()
+        cleanupRpcExports()
         cancelTimeoutTimer()
 
         // Deregister the log callback and release the handler box before
@@ -263,6 +275,99 @@ final class NFSEventLoop: @unchecked Sendable {
         currentSocketIno = 0
     }
 
+    // MARK: - RPC Exports DispatchSource Management
+
+    private func setupRpcExportsSources(fd: Int32) {
+        cancelRpcExportsSources()
+
+        let rs = DispatchSource.makeReadSource(fileDescriptor: fd, queue: queue)
+        rs.setEventHandler { [weak self] in
+            self?.handleRpcExportsEvent(revents: Int32(POLLIN))
+        }
+        rs.setCancelHandler { }
+        rs.resume()
+        rpcExportsReadSource = rs
+
+        let ws = DispatchSource.makeWriteSource(fileDescriptor: fd, queue: queue)
+        ws.setEventHandler { [weak self] in
+            self?.handleRpcExportsEvent(revents: Int32(POLLOUT))
+        }
+        ws.setCancelHandler { }
+        // Start with write active — mount_getexports_async needs to connect first.
+        ws.resume()
+        rpcExportsWriteSuspended = false
+        rpcExportsWriteSource = ws
+    }
+
+    private func cancelRpcExportsSources() {
+        rpcExportsReadSource?.cancel()
+        rpcExportsReadSource = nil
+        if let ws = rpcExportsWriteSource {
+            if rpcExportsWriteSuspended {
+                ws.resume()
+            }
+            ws.cancel()
+        }
+        rpcExportsWriteSource = nil
+        rpcExportsWriteSuspended = true
+    }
+
+    private func handleRpcExportsEvent(revents: Int32) {
+        guard let rpc = rpcExportsCtx else { return }
+
+        let result = rpc_service(rpc, revents)
+
+        // Check if the callback fired BEFORE checking rpc_service return value.
+        // rpc_service returns -1 after the operation completes normally (the RPC
+        // context closes its internal connection). This is expected libnfs behavior.
+        if rpcExportsDone {
+            cleanupRpcExports()
+            return
+        }
+
+        if result < 0 {
+            cleanupRpcExports()
+            return
+        }
+
+        // Unconditionally recreate DispatchSources after rpc_service.
+        // libnfs may close and reopen the socket (same fd number) during
+        // the multi-step connection (portmapper → mountd). kqueue silently
+        // drops registrations on fd reuse, so we must re-register.
+        let newFd = rpc_get_fd(rpc)
+        if newFd >= 0 {
+            setupRpcExportsSources(fd: newFd)
+        }
+
+        updateRpcExportsWriteSource()
+    }
+
+    private func updateRpcExportsWriteSource() {
+        guard let rpc = rpcExportsCtx, let ws = rpcExportsWriteSource else { return }
+        let events = rpc_which_events(rpc)
+        if events & Int32(POLLOUT) != 0 {
+            if rpcExportsWriteSuspended {
+                ws.resume()
+                rpcExportsWriteSuspended = false
+            }
+        } else {
+            if !rpcExportsWriteSuspended {
+                ws.suspend()
+                rpcExportsWriteSuspended = true
+            }
+        }
+    }
+
+    private func cleanupRpcExports() {
+        cancelRpcExportsSources()
+        if let rpc = rpcExportsCtx {
+            rpcExportsCtx = nil
+            rpc_destroy_context(rpc)
+        }
+        rpcExportsDone = false
+        rpcExportsContID = nil
+    }
+
     // MARK: - Timeout Timer
 
     /// Start a periodic timer that checks for timed-out operations.
@@ -298,6 +403,11 @@ final class NFSEventLoop: @unchecked Sendable {
                 recordCompletion(category: cbData.operationCategory, success: false)
                 cbData.resume(.failure(POSIXError(.ETIMEDOUT)))
             }
+        }
+
+        // If the getexports continuation was timed out, clean up its RPC context.
+        if let exContID = rpcExportsContID, activeContinuations[exContID] == nil {
+            cleanupRpcExports()
         }
     }
 
@@ -711,19 +821,24 @@ final class NFSEventLoop: @unchecked Sendable {
         }
     }
 
-    // TODO: C5 — getexports hangs because mount_getexports_async opens its own
-    // RPC connection with a separate fd.  No DispatchSource is registered for
-    // that fd, so nfs_service is never called and the rpcCallback never fires.
-    // Fix: after mount_getexports_async succeeds, obtain the rpc fd via
-    // rpc_get_fd(rpc), create temporary read/write DispatchSources that call
-    // rpc_service(rpc, revents), and tear them down inside the rpcCallback.
-    // This requires libnfs rpc_service/rpc_get_fd to be exposed through the
-    // C bridge (nfs_shim.h) and is tracked as a follow-up task.
     func getexports(server: String) async throws -> [String] {
         try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<[String], Error>) in
             queue.async { [self] in
-                guard let ctx = context else {
-                    continuation.resume(throwing: POSIXError(.ENOTCONN, description: "Not connected"))
+                guard context != nil else {
+                    continuation.resume(throwing: POSIXError(.ENOTCONN, description: "Event loop shut down"))
+                    return
+                }
+
+                guard rpcExportsCtx == nil else {
+                    continuation.resume(throwing: POSIXError(.EBUSY, description: "Export query already in progress"))
+                    return
+                }
+
+                // Create a separate RPC context for the mount/export query.
+                // mount_getexports_async opens its own connection to the mount
+                // service — using the NFS context's RPC would corrupt it.
+                guard let rpc = rpc_init_context() else {
+                    continuation.resume(throwing: POSIXError(.ENOMEM, description: "Failed to create RPC context"))
                     return
                 }
 
@@ -755,21 +870,35 @@ final class NFSEventLoop: @unchecked Sendable {
                         }
                     },
                     completionHook: { [weak self] success in
+                        self?.rpcExportsDone = true
                         self?.handleCallbackCompletion(contID: contID, category: .metadata, success: success)
                     }
                 )
 
                 activeContinuations[contID] = cbData
+                rpcExportsCtx = rpc
+                rpcExportsContID = contID
+                rpcExportsDone = false
 
-                let rpc = nfs_get_rpc_context(ctx)
                 let retainedPtr = Unmanaged.passRetained(cbData).toOpaque()
                 let rc = mount_getexports_async(rpc, server, NFSEventLoop.rpcCallback, retainedPtr)
 
                 if rc < 0 {
                     Unmanaged<CallbackData>.fromOpaque(retainedPtr).release()
                     activeContinuations.removeValue(forKey: contID)
-                    continuation.resume(throwing: POSIXError(.init(Int32(-rc)), description: errorDescription(ctx)))
+                    cleanupRpcExports()
+                    continuation.resume(throwing: POSIXError(.EIO, description: "Failed to start export query"))
+                    return
                 }
+
+                let fd = rpc_get_fd(rpc)
+                guard fd >= 0 else {
+                    startTimeoutTimer()
+                    return
+                }
+
+                setupRpcExportsSources(fd: fd)
+                startTimeoutTimer()
             }
         }
     }

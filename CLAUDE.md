@@ -17,6 +17,14 @@ swift build
 # Run tests (minimal test suite — requires NFS server for real testing)
 swift test
 
+# Run integration tests (requires Docker)
+docker compose -f test-fixtures/docker-compose.yml up -d
+swift test --filter IntegrationTests
+docker compose -f test-fixtures/docker-compose.yml down -v
+
+# Or use the integration test script (handles Docker lifecycle automatically)
+./scripts/test-integration.sh
+
 # Rebuild the libnfs XCFramework from source (requires Homebrew, automake, cmake)
 ./build.sh                          # Build libnfs for all platforms
 ./build.sh -p "macos ios" -a arm64  # Build for specific platforms/archs
@@ -30,18 +38,27 @@ swift test
 
 ```
 NFSClient (public API — Sources/NFSKit/NFSClient.swift)
-    ↓ uses
-NFSContext (C context wrapper — Sources/NFSKit/NFSContext.swift)
+    ↓ delegates to
+NFSEventLoop (event loop — Sources/NFSKit/NFSEventLoop.swift)
     ↓ imports
 nfs target (C bridge — Sources/nfs/)
     ↓ links
 Libnfs.xcframework (pre-built binary — Framework/)
 ```
 
+NFSContext is a legacy wrapper superseded by NFSEventLoop. It remains in the codebase but is not used by NFSClient.
+
 ### Key Files
 
-- **NFSClient.swift** — Public API. Manages connections, file/directory CRUD, upload/download with progress tracking. Thread-safe via `NSLock`/`NSCondition` + concurrent `DispatchQueue`.
-- **NFSContext.swift** — Wraps `UnsafeMutablePointer<nfs_context>`. Implements async operations using callback-based `async_await` pattern with `poll()`. Uses `NSRecursiveLock` for thread safety.
+- **NFSClient.swift** — Public API. Manages connections, file/directory CRUD, upload/download with progress. Sendable with immutable properties; delegates all work to NFSEventLoop.
+- **NFSEventLoop.swift** — Core event loop. Owns `nfs_context*`, manages DispatchSources for I/O on a serial queue, maintains a continuation registry, and routes operations through an adaptive pipeline.
+- **PipelineController.swift** — AIMD congestion control for adaptive pipeline depth.
+- **OperationType.swift** — Classifies NFS operations into bulk/metadata categories for pipeline routing.
+- **OperationBatch.swift** — Groups related operations with ordered reassembly.
+- **ReadBuffer.swift** — ARC-managed wrapper for zero-copy read buffers from libnfs 6.x.
+- **NFSSecurity.swift** — NFS authentication security mode enum.
+- **NFSStats.swift** — RPC transport statistics snapshot.
+- **NFSContext.swift** — Legacy wrapper (superseded by NFSEventLoop). Uses callback-based `async_await` with `poll()` and `NSRecursiveLock`.
 - **NFSFileHandle.swift** — File handle wrapper with read/write/seek. Uses 1MB buffer size for I/O operations.
 - **NFSDirectory.swift** — Swift `Collection` conformance for directory iteration. Not thread-safe.
 - **Extensions.swift** — POSIX error wrapping, `URLResourceKey` helpers, `Optional.unwrap()` throwing helper, stream utilities.
@@ -76,8 +93,17 @@ The `cSettings` in Package.swift define compile flags (`HAVE_CONFIG_H`, `HAVE_SO
 
 ## Key Patterns
 
-- **Async pattern**: NFSContext uses a callback-based `async_await` method that polls the NFS file descriptor for events — not Swift structured concurrency.
+- **Event loop**: NFSEventLoop uses DispatchSources (not Swift structured concurrency) on a serial queue. All mutable NFS state is confined to this queue.
+- **Pipeline**: Operations are classified as bulk or metadata and routed through separate AIMD-controlled pipelines.
+- **Callbacks**: libnfs async functions take C callbacks. NFSEventLoop wraps these with `CallbackData` objects passed via `Unmanaged` pointers, resuming `CheckedContinuation`s when complete.
 - **Error handling**: POSIX errno values are wrapped into Swift `Error` via `POSIXError` in Extensions.swift.
-- **Memory management**: Unsafe C pointers are managed carefully with `deinit` cleanup in NFSContext. `Optional.unwrap()` throws on nil to avoid force-unwraps.
+- **Memory management**: Unsafe C pointers managed with `deinit` cleanup. `Optional.unwrap()` throws on nil. `ReadBuffer` provides ARC-managed zero-copy reads.
 - **Progress tracking**: File transfers use Foundation `Progress` objects with cancellation callbacks.
-- **Thread safety**: `NFSClient` uses `NSLock` for connection and `NSCondition` for operation counting. `NFSContext` uses `NSRecursiveLock`. `NFSDirectory` is explicitly not thread-safe.
+- **Thread safety**: NFSClient is Sendable (immutable properties). All mutable state lives on NFSEventLoop's serial DispatchQueue. NFSDirectory is not thread-safe.
+
+## libnfs Gotchas
+
+- **DispatchSource fd reuse**: libnfs closes and reopens sockets during multi-step connections (portmapper → mountd → nfsd). macOS may reuse the same fd number, and kqueue silently drops the old registration. DispatchSources must be unconditionally recreated after each `nfs_service`/`rpc_service` call.
+- **`rpc_service` returns -1 after callback**: This is normal libnfs behavior — the connection closes after the RPC response. Always check the completion flag before checking the return value.
+- **`mount_getexports_async` needs a separate `rpc_context`**: Create via `rpc_init_context()`, not `nfs_get_rpc_context(ctx)`. Using the NFS context's RPC would corrupt its connection state. See `Vendor/libnfs/examples/nfsclient-async.c` for the reference pattern.
+- **RPC functions available via C bridge**: `rpc_get_fd`, `rpc_which_events`, `rpc_service`, `rpc_init_context`, `rpc_destroy_context` are all accessible through `libnfs-raw.h` (included by `nfs_shim.h`).
