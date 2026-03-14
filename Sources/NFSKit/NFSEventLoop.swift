@@ -319,11 +319,17 @@ final class NFSEventLoop: @unchecked Sendable {
         // (portmapper → mountd → nfsd). When the OS reuses the fd number,
         // kqueue silently drops the old registration, so we must re-create
         // DispatchSources to get events on the new socket.
+        //
+        // When fstat cannot return a meaningful inode (st_ino == 0, which
+        // happens on some macOS versions for sockets), the inode comparison
+        // is unreliable. In that case we unconditionally recreate sources
+        // so that a dup2'd socket always gets fresh kqueue registrations.
         let newFd = nfs_get_fd(ctx)
         if newFd >= 0 {
+            let newIno = Self.socketIno(newFd)
             if newFd != currentFd {
                 setupSources(fd: newFd)
-            } else if Self.socketIno(newFd) != currentSocketIno {
+            } else if currentSocketIno == 0 || newIno != currentSocketIno {
                 setupSources(fd: newFd)
             }
         }

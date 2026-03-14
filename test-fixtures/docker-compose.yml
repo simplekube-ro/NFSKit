@@ -1,0 +1,20 @@
+version: "3.8"
+services:
+  nfs-test:
+    image: ghcr.io/simplekube-ro/nfs-ganesha:1.1
+    container_name: nfskit-nfs-test
+    ports:
+      - "111:111"
+      - "2049:2049"
+      - "20048:20048"
+      - "32803:32803"
+    volumes:
+      - nfs-data:/share
+      - ./nfs/ganesha.conf:/etc/ganesha/ganesha.conf
+    cap_add:
+      - DAC_READ_SEARCH
+      - DAC_OVERRIDE
+    restart: "no"
+
+volumes:
+  nfs-data:
