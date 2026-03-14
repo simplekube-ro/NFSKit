@@ -46,8 +46,6 @@ nfs target (C bridge — Sources/nfs/)
 Libnfs.xcframework (pre-built binary — Framework/)
 ```
 
-NFSContext is a legacy wrapper superseded by NFSEventLoop. It remains in the codebase but is not used by NFSClient.
-
 ### Key Files
 
 - **NFSClient.swift** — Public API. Manages connections, file/directory CRUD, upload/download with progress. Sendable with immutable properties; delegates all work to NFSEventLoop.
@@ -58,9 +56,7 @@ NFSContext is a legacy wrapper superseded by NFSEventLoop. It remains in the cod
 - **ReadBuffer.swift** — ARC-managed wrapper for zero-copy read buffers from libnfs 6.x.
 - **NFSSecurity.swift** — NFS authentication security mode enum.
 - **NFSStats.swift** — RPC transport statistics snapshot.
-- **NFSContext.swift** — Legacy wrapper (superseded by NFSEventLoop). Uses callback-based `async_await` with `poll()` and `NSRecursiveLock`.
 - **NFSFileHandle.swift** — File handle wrapper with read/write/seek. Uses 1MB buffer size for I/O operations.
-- **NFSDirectory.swift** — Swift `Collection` conformance for directory iteration. Not thread-safe.
 - **Extensions.swift** — POSIX error wrapping, `URLResourceKey` helpers, `Optional.unwrap()` throwing helper, stream utilities.
 - **Parser.swift** — Converts C types (`statvfs`, `nfs_stat_64`, opaque pointers) to Swift types.
 
@@ -99,7 +95,7 @@ The `cSettings` in Package.swift define compile flags (`HAVE_CONFIG_H`, `HAVE_SO
 - **Error handling**: POSIX errno values are wrapped into Swift `Error` via `POSIXError` in Extensions.swift.
 - **Memory management**: Unsafe C pointers managed with `deinit` cleanup. `Optional.unwrap()` throws on nil. `ReadBuffer` provides ARC-managed zero-copy reads.
 - **Progress tracking**: File transfers use Foundation `Progress` objects with cancellation callbacks.
-- **Thread safety**: NFSClient is Sendable (immutable properties). All mutable state lives on NFSEventLoop's serial DispatchQueue. NFSDirectory is not thread-safe.
+- **Thread safety**: NFSClient is Sendable (immutable properties). All mutable state lives on NFSEventLoop's serial DispatchQueue. `CallbackData.resume()` includes a `dispatchPrecondition` assertion to enforce queue confinement.
 
 ## libnfs Gotchas
 

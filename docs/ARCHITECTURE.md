@@ -86,7 +86,10 @@ sequenceDiagram
 **Key implementation details:**
 
 - `CallbackData` is a heap-allocated Swift object that holds the `CheckedContinuation`,
-  the operation ID, and a `hasResumed` flag that prevents double-resume during shutdown.
+  the operation ID, a `hasResumed` flag that prevents double-resume during shutdown,
+  and an optional `cleanup` closure for freeing heap-allocated buffers on any path
+  (success or error). The `resume()` method includes a `dispatchPrecondition` assertion
+  to enforce queue confinement at runtime.
 - The opaque pointer passed to libnfs is produced by `Unmanaged.passRetained()`, which
   increments the ARC retain count. The callback recovers the object with
   `Unmanaged.fromOpaque(_:).takeRetainedValue()`, which decrements it — giving the callback
@@ -220,17 +223,15 @@ Sources/nfs/
     └── libnfs-private.h     # Private libnfs types needed by NFSEventLoop
 ```
 
-`nfs_shim.h` includes every libnfs public and raw header:
+`nfs_shim.h` includes only the headers required by NFSKit:
 
 ```
 libnfs.h             — high-level NFS API (nfs_context*, nfs_mount, nfs_open, ...)
 libnfs-raw.h         — raw RPC layer (rpc_context*, rpc_get_fd, rpc_service, ...)
-libnfs-raw-mount.h   — mount protocol (mount_getexports_async, ...)
-libnfs-raw-nfs.h     — NFS protocol raw types
-libnfs-raw-portmap.h — portmapper protocol
-libnfs-zdr.h         — ZDR (XDR variant) serialisation
-... (plus nfs4, nlm, nsm, rquota)
+libnfs-raw-mount.h   — mount protocol (mount_getexports_async, exports, exportnode)
 ```
+
+Unused protocol headers (nfs4, nlm, nsm, portmap, rquota, zdr) were removed to minimize the attack surface exposed to Swift code.
 
 The `cSettings` block in `Package.swift` defines the preprocessor flags required by these
 headers: `HAVE_CONFIG_H`, `HAVE_SOCKADDR_LEN`, `_FILE_OFFSET_BITS=64`, and the
@@ -269,10 +270,16 @@ nfs_*_async called
     → Unmanaged.passRetained(callbackData)   # ARC +1, gives C a raw pointer
     → libnfs holds opaquePtr
 
-C callback fires
+C callback fires (success path: status >= 0)
     → Unmanaged.fromOpaque(opaquePtr)
          .takeRetainedValue()                # ARC -1, Swift reclaims ownership
+    → callbackData.dataHandler(status, data) # extracts result, may free buffers
     → callbackData.resume(result)
+    → callbackData released by ARC
+
+C callback fires (error path: status < 0)
+    → callbackData.cleanup?()               # frees heap-allocated buffers (writeBuf, readBuf)
+    → callbackData.resume(.failure(error))
     → callbackData released by ARC
 ```
 
@@ -280,6 +287,9 @@ The `hasResumed` flag in `CallbackData` is a single-assignment guard. If the eve
 is torn down while an operation is in flight, the shutdown path calls `resume(.failure)`
 on all active continuations; the flag ensures the C callback — if it fires late — does
 not resume the already-completed continuation a second time, which would crash.
+A `dispatchPrecondition(condition: .onQueue(queue))` assertion enforces that `resume()`
+is always called on the event loop's serial queue, catching thread-safety violations in
+debug builds.
 
 ### ReadBuffer and zero-copy reads
 
@@ -346,7 +356,6 @@ server-side resource exhaustion.
 | `PipelineController` | `Sendable` | Value type; mutated only on the serial queue |
 | `NFSSecurity` | `Sendable` | Enum (value type) |
 | `NFSStats` | `Sendable` | Struct of value types |
-| `NFSDirectory` | (none) | Legacy, not thread-safe, internal use only |
 
 ### Queue confinement rules
 

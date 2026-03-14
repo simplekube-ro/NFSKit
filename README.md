@@ -79,14 +79,14 @@ Configure performance parameters **before** connecting:
 ```swift
 let client = try NFSClient(url: url)!
 
-client.configurePerformance(
+try client.configurePerformance(
     readMax: 1_048_576,    // 1 MB max read size
     writeMax: 1_048_576,   // 1 MB max write size
     autoReconnect: -1,     // infinite reconnect retries
     timeout: 30_000        // 30 second RPC timeout (ms)
 )
 
-client.setSecurity(.system) // or .kerberos5, .kerberos5i, .kerberos5p
+try client.setSecurity(.system) // or .kerberos5, .kerberos5i, .kerberos5p
 
 try await client.connect(export: "/share")
 ```
