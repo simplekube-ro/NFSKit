@@ -52,7 +52,7 @@
 #define HAVE_SOCKADDR_STORAGE
 
 /* Whether our sockets support SO_BINDTODEVICE */
-#define HAVE_SO_BINDTODEVICE
+/* #undef HAVE_SO_BINDTODEVICE */
 
 /* Define to 1 if you have the <stdint.h> header file. */
 #define HAVE_STDINT_H

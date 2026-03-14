@@ -16,6 +16,11 @@ import nfs
 /// ``NFSClient/connect(export:)`` to configure the authentication
 /// mechanism used for all NFS RPCs.
 ///
+/// - Important: The default ``system`` (`AUTH_SYS`) mode provides **no encryption**,
+///   **no message integrity**, and UID/GID-based authentication that can be forged by
+///   any client on the network. For sensitive deployments, use ``kerberos5p`` which
+///   provides Kerberos 5 authentication with data privacy (encryption).
+///
 /// - Note: Kerberos modes require the host to have a valid Kerberos
 ///   configuration and the libnfs build to have been compiled with
 ///   `HAVE_LIBKRB5`. Attempting to use them without KRB5 support will

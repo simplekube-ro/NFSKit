@@ -72,16 +72,15 @@ final class NFSClientSendableTests: XCTestCase {
         XCTAssertNil(client)
     }
 
-    func testNFSClientConfigurePerformanceDoesNotCrash() throws {
+    func testNFSClientConfigurePerformanceDoesNotThrow() throws {
         let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
-        // configurePerformance is non-throwing and should not crash
-        client.configurePerformance(readMax: 1024)
-        client.configurePerformance(autoReconnect: -1)
+        try client.configurePerformance(readMax: 1024)
+        try client.configurePerformance(autoReconnect: -1)
     }
 
     func testNFSClientConfigurePerformanceAllParams() throws {
         let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
-        client.configurePerformance(
+        try client.configurePerformance(
             readMax: 1_048_576,
             autoReconnect: 3
         )
@@ -90,6 +89,6 @@ final class NFSClientSendableTests: XCTestCase {
     func testNFSClientConfigurePerformanceAllNils() throws {
         let client = try XCTUnwrap(try NFSClient(url: URL(string: "nfs://localhost")!))
         // All nil parameters - should be a no-op
-        client.configurePerformance()
+        try client.configurePerformance()
     }
 }

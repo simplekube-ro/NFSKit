@@ -50,6 +50,10 @@ extension NFSClient {
     /// After a successful connect, the client automatically sets the UID/GID
     /// from the root directory attributes for subsequent operations.
     ///
+    /// - Important: By default, NFS connections use `AUTH_SYS` which provides no
+    ///   encryption or strong authentication. Call ``setSecurity(_:)`` with
+    ///   ``NFSSecurity/kerberos5p`` **before** connecting if the network is untrusted.
+    ///
     /// - Parameter export: The export path (e.g. `/share`).
     public func connect(export: String) async throws {
         let host = url.host ?? "localhost"
@@ -80,9 +84,19 @@ extension NFSClient {
 
     /// Open a file and return a token-based handle.
     ///
+    /// Supported flag combinations:
+    /// - `O_RDONLY` — read-only access (default)
+    /// - `O_WRONLY | O_CREAT | O_TRUNC` — create/overwrite for writing
+    /// - `O_RDWR` — read-write access
+    /// - `O_WRONLY | O_CREAT | O_APPEND` — append to file
+    ///
+    /// Other flag combinations are passed through to the NFS server, which
+    /// applies its own validation. Behavior for unsupported combinations is
+    /// server-dependent.
+    ///
     /// - Parameters:
     ///   - path: The file path on the NFS share.
-    ///   - flags: POSIX open flags (`O_RDONLY`, `O_WRONLY | O_CREAT | O_TRUNC`, etc.).
+    ///   - flags: POSIX open flags.
     /// - Returns: An ``NFSFileHandle`` token for subsequent I/O.
     public func openFile(atPath path: String, flags: Int32 = O_RDONLY) async throws -> NFSFileHandle {
         let handleID = try await eventLoop.openFile(path, flags: flags)
@@ -167,7 +181,7 @@ extension NFSClient {
         fileSize: Int64,
         progress: (@Sendable (Int64, Int64) -> Bool)?
     ) async throws -> Data {
-        let chunkSize = try eventLoop.getReadMax()
+        let chunkSize = min(try eventLoop.getReadMax(), 4 * 1024 * 1024)
         let totalBytes = Int(fileSize)
         let totalChunks = (totalBytes + chunkSize - 1) / chunkSize
 
@@ -221,8 +235,12 @@ extension NFSClient {
             }
         }
 
-        // Transfer buffer ownership to Data.  The pointer will be freed by the
-        // custom deallocator when the last Data reference is released.
+        // SAFETY INVARIANT: disown() and Data(bytesNoCopy:) must be adjacent with
+        // no intervening code that can throw. disown() prevents ReadBuffer.deinit
+        // from freeing the pointer; Data's deallocator takes over that responsibility.
+        // If code between them throws, the pointer leaks (disown already called) or
+        // double-frees (if disown is skipped). Structured concurrency guarantees all
+        // child tasks have completed before reaching this point.
         buffer.disown()
         return Data(
             bytesNoCopy: buffer.pointer,
@@ -358,6 +376,8 @@ extension NFSClient {
         let items = try await contentsOfDirectory(atPath: path)
         for item in items {
             guard let name = item[.nameKey] as? String else { continue }
+            // Reject names that could construct a path traversal.
+            guard !name.contains("/"), name != ".", name != ".." else { continue }
             let fullPath = path.hasSuffix("/") ? path + name : path + "/" + name
             try await removeItem(atPath: fullPath)
         }
@@ -439,25 +459,24 @@ extension NFSClient {
         autoReconnect: Int32? = nil,
         retransmissions: Int32? = nil,
         timeout: Int32? = nil
-    ) {
-        if let readMax = readMax { try? eventLoop.setReadMax(readMax) }
-        if let writeMax = writeMax { try? eventLoop.setWriteMax(writeMax) }
-        if let retries = autoReconnect { try? eventLoop.setAutoReconnect(retries) }
-        if let count = retransmissions { try? eventLoop.setRetransmissions(count) }
-        if let milliseconds = timeout { try? eventLoop.setTimeout(milliseconds) }
+    ) throws {
+        if let readMax = readMax { try eventLoop.setReadMax(readMax) }
+        if let writeMax = writeMax { try eventLoop.setWriteMax(writeMax) }
+        if let retries = autoReconnect { try eventLoop.setAutoReconnect(retries) }
+        if let count = retransmissions { try eventLoop.setRetransmissions(count) }
+        if let milliseconds = timeout { try eventLoop.setTimeout(milliseconds) }
     }
 
     /// Set the NFS authentication security mode.
     ///
     /// Must be called **before** ``connect(export:)`` — libnfs reads the
-    /// security setting during mount negotiation. If called after the
-    /// underlying connection is open the call is silently ignored; use
-    /// ``NFSEventLoop/setSecurity(_:)`` directly if you need to detect
-    /// that case.
+    /// security setting during mount negotiation.
     ///
     /// - Parameter security: The desired ``NFSSecurity`` mode.
-    public func setSecurity(_ security: NFSSecurity) {
-        try? eventLoop.setSecurity(security)
+    /// - Throws: If the security mode cannot be applied (e.g. called after
+    ///   the connection is already established).
+    public func setSecurity(_ security: NFSSecurity) throws {
+        try eventLoop.setSecurity(security)
     }
 
 }

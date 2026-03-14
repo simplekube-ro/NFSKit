@@ -126,9 +126,11 @@ final class NFSEventLoopTests: XCTestCase {
     // MARK: 10. Callback data retains and releases correctly
 
     func testCallbackDataLifecycle() {
+        let testQueue = DispatchQueue(label: "test.callback")
         var resumed = false
         let cbData = NFSEventLoop.CallbackData(
             continuationID: 1,
+            queue: testQueue,
             dataHandler: { _, _ in .success(()) },
             resume: { _ in resumed = true }
         )
@@ -137,7 +139,9 @@ final class NFSEventLoopTests: XCTestCase {
         XCTAssertNotNil(ptr)
 
         let recovered = Unmanaged<NFSEventLoop.CallbackData>.fromOpaque(ptr).takeRetainedValue()
-        recovered.resume(.success(42))
+        testQueue.sync {
+            recovered.resume(.success(42))
+        }
         XCTAssertTrue(resumed, "Resume should have been called")
     }
 
@@ -222,9 +226,11 @@ final class NFSEventLoopTests: XCTestCase {
 final class CallbackDataTests: XCTestCase {
 
     func testCallbackDataHandlerSuccess() {
+        let testQueue = DispatchQueue(label: "test.callback.success")
         var receivedResult: Result<Any, Error>?
         let cbData = NFSEventLoop.CallbackData(
             continuationID: 42,
+            queue: testQueue,
             dataHandler: { _, _ in
                 return .success("hello")
             },
@@ -235,8 +241,10 @@ final class CallbackDataTests: XCTestCase {
 
         XCTAssertEqual(cbData.continuationID, 42)
 
-        let handlerResult = cbData.dataHandler(0, nil)
-        cbData.resume(handlerResult)
+        let handlerResult = cbData.dataHandler(0, nil as UnsafeMutableRawPointer?)
+        testQueue.sync {
+            cbData.resume(handlerResult)
+        }
 
         if case .success(let value) = receivedResult {
             XCTAssertEqual(value as? String, "hello")
@@ -246,9 +254,11 @@ final class CallbackDataTests: XCTestCase {
     }
 
     func testCallbackDataHandlerFailure() {
+        let testQueue = DispatchQueue(label: "test.callback.failure")
         var receivedResult: Result<Any, Error>?
         let cbData = NFSEventLoop.CallbackData(
             continuationID: 1,
+            queue: testQueue,
             dataHandler: { _, _ in
                 return .failure(POSIXError(.EIO))
             },
@@ -257,8 +267,10 @@ final class CallbackDataTests: XCTestCase {
             }
         )
 
-        let handlerResult = cbData.dataHandler(0, nil)
-        cbData.resume(handlerResult)
+        let handlerResult = cbData.dataHandler(0, nil as UnsafeMutableRawPointer?)
+        testQueue.sync {
+            cbData.resume(handlerResult)
+        }
 
         if case .failure(let error) = receivedResult {
             let posixError = error as? POSIXError

@@ -63,7 +63,7 @@ Mounts the given NFS export. After a successful mount, the client automatically 
 
 **Throws** `POSIXError` if the mount fails (DNS resolution failure, server unreachable, export not found, etc.).
 
-**Note** Call `configurePerformance(...)` and `setSecurity(_:)` before this method. Settings applied after connection are silently ignored or have no effect.
+**Note** Call `configurePerformance(...)` and `setSecurity(_:)` before this method. Both methods throw if called after the connection is established.
 
 ---
 
@@ -321,7 +321,7 @@ public func configurePerformance(
     autoReconnect: Int32? = nil,
     retransmissions: Int32? = nil,
     timeout: Int32? = nil
-)
+) throws
 ```
 
 Configures libnfs performance parameters. **Must be called before `connect(export:)`** — several settings are read during mount negotiation and cannot be changed afterward.
@@ -338,17 +338,19 @@ All parameters are optional; pass only the values you want to override.
 | `retransmissions` | Number of RPC retransmissions to attempt before reporting a failure. |
 | `timeout` | RPC timeout in milliseconds. |
 
-**Note** Errors from individual parameter setters are silently swallowed. If exact enforcement is required, use `NFSEventLoop` directly.
+**Throws** `POSIXError` if any parameter cannot be applied (e.g. the context has been destroyed).
 
 ---
 
 #### setSecurity(_:)
 
 ```swift
-public func setSecurity(_ security: NFSSecurity)
+public func setSecurity(_ security: NFSSecurity) throws
 ```
 
-Sets the NFS authentication security mode. **Must be called before `connect(export:)`**. If called after the underlying connection is open, the call is silently ignored.
+Sets the NFS authentication security mode. **Must be called before `connect(export:)`**.
+
+**Throws** `POSIXError` if the security mode cannot be applied (e.g. called after the connection is already established).
 
 **Parameters**
 
