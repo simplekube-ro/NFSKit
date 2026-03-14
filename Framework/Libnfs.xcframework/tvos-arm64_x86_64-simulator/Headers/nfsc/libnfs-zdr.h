@@ -1,3 +1,4 @@
+/* -*-  mode:c; tab-width:8; c-basic-offset:8; indent-tabs-mode:nil;  -*- */
 /*
    Copyright (C) 2012 by Ronnie Sahlberg <ronniesahlberg@gmail.com>
 
@@ -105,17 +106,32 @@ typedef uint32_t (*zdrproc_t) (ZDR *, void *,...);
 #define AUTH_NULL 0
 #define AUTH_SYS  1
 #define AUTH_UNIX 1
+#define AUTH_GSS  6
 
-struct opaque_auth {
+#ifdef HAVE_TLS
+#define AUTH_TLS  7
+#endif
+
+struct opaque_cred {
 	uint32_t oa_flavor;
 	caddr_t  oa_base;
 	uint32_t oa_length;
 };
-extern struct opaque_auth _null_auth;
+
+struct gss_ctx_id_struct;
+struct opaque_verf {
+	uint32_t oa_flavor;
+	caddr_t  oa_base;
+	uint32_t oa_length;
+
+        /* GSS */
+        struct gss_ctx_id_struct *gss_context;
+};
+extern struct opaque_verf _null_auth;
 
 struct AUTH {
-	struct opaque_auth	ah_cred;
-	struct opaque_auth	ah_verf;
+	struct opaque_cred	ah_cred;
+	struct opaque_verf	ah_verf;
 	caddr_t ah_private;
 };
 
@@ -167,18 +183,23 @@ struct call_body {
 	uint32_t prog;
 	uint32_t vers;
 	uint32_t proc;
-	struct opaque_auth cred;
-	struct opaque_auth verf;
+	struct opaque_cred cred;
+	struct opaque_verf verf;
 	void    *args;
 };
 
 struct accepted_reply {
-	struct opaque_auth	verf;
+	struct opaque_verf	verf;
 	uint32_t		stat;
 	union {
 		struct {
 			caddr_t	where;
 			zdrproc_t proc;
+
+                        /* GSS */
+                        uint32_t krb5i;
+                        uint32_t krb5p;
+                        void *output_buffer;
 		} results;
 		struct {
 			uint32_t	low;
@@ -266,6 +287,12 @@ bool_t libnfs_zdr_setpos(ZDR *zdrs, uint32_t pos);
 #define zdr_getpos libnfs_zdr_getpos
 uint32_t libnfs_zdr_getpos(ZDR *zdrs);
 
+#define zdr_getsize libnfs_zdr_getsize
+uint32_t libnfs_zdr_getsize(ZDR *zdrs);
+
+#define zdr_getptr libnfs_zdr_getptr
+char *libnfs_zdr_getptr(ZDR *zdrs);
+        
 #define zdr_free libnfs_zdr_free
 void libnfs_zdr_free(zdrproc_t proc, char *objp);
 
@@ -285,6 +312,9 @@ struct AUTH *libnfs_authunix_create(const char *host, uint32_t uid, uint32_t gid
 
 #define authunix_create_default libnfs_authunix_create_default
 struct AUTH *libnfs_authunix_create_default(void);
+
+int libnfs_authgss_init(struct rpc_context *rpc);
+int libnfs_authgss_gen_creds(struct rpc_context *rpc, ZDR *zdr, int level);
 
 #define auth_destroy libnfs_auth_destroy
 void libnfs_auth_destroy(struct AUTH *auth);

@@ -28,8 +28,7 @@
 #endif
 
 #include <stdint.h>
-#if defined(__ANDROID__) || defined(AROS) || defined(__PPU__) \
- || ( defined(__APPLE__) && defined(__MACH__) ) || defined(__FreeBSD__) || defined(__OpenBSD__)
+#if !defined(_WIN32)
 #include <sys/time.h>
 #else
 #include <time.h>
@@ -39,14 +38,12 @@
 extern "C" {
 #endif
 
-#define LIBNFS_FEATURE_READAHEAD
-#define LIBNFS_FEATURE_PAGECACHE
+#define LIBNFS_API_V2
 #define LIBNFS_FEATURE_DEBUG
 #define LIBNFS_FEATURE_UMOUNT
 #define LIBNFS_FEATURE_MULTITHREADING
 
 #define NFS_BLKSIZE 4096
-#define NFS_PAGECACHE_DEFAULT_TTL 5
 
 struct nfs_context;
 struct rpc_context;
@@ -66,6 +63,7 @@ struct nfs_url {
 #endif
 
 #ifdef WIN32
+#include <winsock2.h>
 #ifdef HAVE_FUSE_H
 #include <fuse.h>
 #else
@@ -140,6 +138,32 @@ struct AUTH;
 EXTERN void nfs_set_auth(struct nfs_context *nfs, struct AUTH *auth);
 
 /*
+ * Used to set which security to use.
+ */
+enum rpc_sec {
+        RPC_SEC_UNDEFINED = 0,
+        RPC_SEC_KRB5,
+        RPC_SEC_KRB5I,
+        RPC_SEC_KRB5P,
+};
+EXTERN void nfs_set_security(struct nfs_context *nfs, enum rpc_sec sec);
+        
+#ifdef HAVE_TLS
+/*
+ * Various transport level security values that map to the mount option
+ * xprtsec=[none,tls,mtls].
+ */
+enum rpc_xprtsec {
+	RPC_XPRTSEC_UNDEFINED = 0,
+	RPC_XPRTSEC_NONE,	/* No transport security */
+	RPC_XPRTSEC_TLS,	/* TLS, with server authentication */
+	RPC_XPRTSEC_MTLS,	/* Mutual TLS, with both server and client authentication */
+};
+
+EXTERN void nfs_set_xprtsecurity(struct nfs_context *nfs, enum rpc_xprtsec xprtsec);
+#endif /* HAVE_TLS */
+
+/*
  * Used if you need to bind to a specific interface.
  * Only available on platforms that support SO_BINDTODEVICE.
  */
@@ -162,7 +186,6 @@ typedef void (*nfs_cb)(int err, struct nfs_context *nfs, void *data,
  */
 typedef void (*rpc_cb)(struct rpc_context *rpc, int status, void *data,
                        void *private_data);
-
 
 
 /*
@@ -216,8 +239,13 @@ EXTERN int nfs_set_hash_size(struct nfs_context *nfs, int hashes);
  *                     default is 65534 on Windows and getuid() on unixen.
  * gid=<int>         : GID value to use when talking to the server.
  *                     default is 65534 on Windows and getgid() on unixen.
- * readahead=<int>   : Enable readahead for files and set the maximum amount
- *                     of readahead to <int> bytes.
+ * sec=<krb5|krb5i|krb5p>
+ *                   : Specify the security mode.
+ * xprtsec=<none|tls|mtls>
+ *                   : Specify the transport security mode.
+ *                     none : No TLS security.
+ *                     tls  : TLS with server authentication only.
+ *                     mtls : Mutual TLS, both server and client authentication.
  * auto-traverse-mounts=<0|1>
  *                   : Should libnfs try to traverse across nested mounts
  *                     automatically or not. Default is 1 == enabled.
@@ -275,24 +303,29 @@ EXTERN void nfs_destroy_url(struct nfs_url *url);
 struct nfsfh;
 
 /*
+ * Get the NFS server address we are currently connected to.
+ */
+EXTERN const struct sockaddr_storage *nfs_get_server_address(struct nfs_context *nfs);
+
+/*
  * Get the maximum supported READ size by the server
  */
-EXTERN uint64_t nfs_get_readmax(struct nfs_context *nfs);
+EXTERN size_t nfs_get_readmax(struct nfs_context *nfs);
 
 /*
  * Get the maximum supported WRITE size by the server
  */
-EXTERN uint64_t nfs_get_writemax(struct nfs_context *nfs);
+EXTERN size_t nfs_get_writemax(struct nfs_context *nfs);
 
 /*
  * Set the maximum supported READ size by the server
  */
-EXTERN void nfs_set_readmax(struct nfs_context *nfs, uint64_t readmax);
+EXTERN void nfs_set_readmax(struct nfs_context *nfs, size_t readmax);
 
 /*
  * Set the maximum supported WRITE size by the server
  */
-EXTERN void nfs_set_writemax(struct nfs_context *nfs, uint64_t writemax);
+EXTERN void nfs_set_writemax(struct nfs_context *nfs, size_t writemax);
         
 /*
  *  MODIFY CONNECT PARAMETERS
@@ -302,15 +335,14 @@ EXTERN void nfs_set_tcp_syncnt(struct nfs_context *nfs, int v);
 EXTERN void nfs_set_uid(struct nfs_context *nfs, int uid);
 EXTERN void nfs_set_gid(struct nfs_context *nfs, int gid);
 EXTERN void nfs_set_auxiliary_gids(struct nfs_context *nfs, uint32_t len, uint32_t* gids);
-EXTERN void nfs_set_pagecache(struct nfs_context *nfs, uint32_t v);
-EXTERN void nfs_set_pagecache_ttl(struct nfs_context *nfs, uint32_t v);
-EXTERN void nfs_set_readahead(struct nfs_context *nfs, uint32_t v);
 EXTERN void nfs_set_debug(struct nfs_context *nfs, int level);
 EXTERN void nfs_set_auto_traverse_mounts(struct nfs_context *nfs, int enabled);
 EXTERN void nfs_set_dircache(struct nfs_context *nfs, int enabled);
 EXTERN void nfs_set_autoreconnect(struct nfs_context *nfs, int num_retries);
+EXTERN void nfs_set_retrans(struct nfs_context *nfs, int retrans);
 EXTERN void nfs_set_nfsport(struct nfs_context *nfs, int port);
 EXTERN void nfs_set_mountport(struct nfs_context *nfs, int port);
+EXTERN size_t nfs_get_readdir_maxcount(struct nfs_context *nfs);
 EXTERN void nfs_set_readdir_max_buffer_size(struct nfs_context *nfs, uint32_t dircount, uint32_t maxcount);
 
 /*
@@ -325,18 +357,6 @@ EXTERN int nfs_set_version(struct nfs_context *nfs, int version);
  * NFS_V4
  */
 EXTERN int nfs_get_version(struct nfs_context *nfs);
-
-/*
- *  Invalidate the pagecache
- */
-EXTERN void nfs_pagecache_invalidate(struct nfs_context *nfs,
-                                     struct nfsfh *nfsfh);
-
-/*
- * Initialize the pagecache
- */
-EXTERN  void nfs_pagecache_init(struct nfs_context *nfs,
-                                struct nfsfh *nfsfh);
 
 /*
  * MOUNT THE EXPORT
@@ -468,7 +488,7 @@ struct nfs_stat_64 {
 };
 
 /*
- * Async stat(<filename>)
+ * Async stat64filename>)
  * Function returns
  *  0 : The command was queued successfully. The callback will be invoked once
  *      the command completes.
@@ -484,7 +504,7 @@ struct nfs_stat_64 {
 EXTERN int nfs_stat64_async(struct nfs_context *nfs, const char *path,
                             nfs_cb cb, void *private_data);
 /*
- * Sync stat(<filename>)
+ * Sync stat64filename>)
  * Function returns
  *      0 : The operation was successful.
  * -errno : The command failed.
@@ -696,13 +716,12 @@ EXTERN int nfs_close(struct nfs_context *nfs, struct nfsfh *nfsfh);
  * When the callback is invoked, status indicates the result:
  *    >=0 : Success.
  *          status is numer of bytes read.
- *          data is a pointer to the returned data.
  * -errno : An error occured.
  *          data is the error string.
  */
 EXTERN int nfs_pread_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                           uint64_t offset, uint64_t count, nfs_cb cb,
-                           void *private_data);
+                           void *buf, size_t count, uint64_t offset,
+                           nfs_cb cb, void *private_data);
 /*
  * Sync pread()
  * Function returns
@@ -710,7 +729,7 @@ EXTERN int nfs_pread_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
  * -errno : An error occured.
  */
 EXTERN int nfs_pread(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                     uint64_t offset, uint64_t count, void *buf);
+                     void *buf, size_t count, uint64_t offset);
 
 
 
@@ -729,12 +748,12 @@ EXTERN int nfs_pread(struct nfs_context *nfs, struct nfsfh *nfsfh,
  * When the callback is invoked, status indicates the result:
  *    >=0 : Success.
  *          status is numer of bytes read.
- *          data is a pointer to the returned data.
  * -errno : An error occured.
  *          data is the error string.
  */
 EXTERN int nfs_read_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                          uint64_t count, nfs_cb cb, void *private_data);
+                          void *buf, size_t count,
+                          nfs_cb cb, void *private_data);
 /*
  * Sync read()
  * Function returns
@@ -742,10 +761,7 @@ EXTERN int nfs_read_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
  * -errno : An error occured.
  */
 EXTERN int nfs_read(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                    uint64_t count, void *buf);
-
-
-
+                    void *buf, size_t count);
 
 /*
  * PWRITE()
@@ -766,7 +782,7 @@ EXTERN int nfs_read(struct nfs_context *nfs, struct nfsfh *nfsfh,
  *          data is the error string.
  */
 EXTERN int nfs_pwrite_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                            uint64_t offset, uint64_t count, const void *buf,
+                            const void *buf, size_t count, uint64_t offset,
                             nfs_cb cb, void *private_data);
 /*
  * Sync pwrite()
@@ -775,7 +791,7 @@ EXTERN int nfs_pwrite_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
  * -errno : An error occured.
  */
 EXTERN int nfs_pwrite(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                      uint64_t offset, uint64_t count, const void *buf);
+                      const void *buf, size_t count, uint64_t offset);
 
 
 /*
@@ -797,8 +813,8 @@ EXTERN int nfs_pwrite(struct nfs_context *nfs, struct nfsfh *nfsfh,
  *          data is the error string.
  */
 EXTERN int nfs_write_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                           uint64_t count, const void *buf, nfs_cb cb,
-                           void *private_data);
+                           const void *buf, size_t count,
+                           nfs_cb cb, void *private_data);
 /*
  * Sync write()
  * Function returns
@@ -806,7 +822,7 @@ EXTERN int nfs_write_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
  * -errno : An error occured.
  */
 EXTERN int nfs_write(struct nfs_context *nfs, struct nfsfh *nfsfh,
-                     uint64_t count, const void *buf);
+                     const void *buf, uint64_t count);
 
 
 /*
@@ -833,7 +849,7 @@ EXTERN int nfs_lseek_async(struct nfs_context *nfs, struct nfsfh *nfsfh,
 /*
  * Sync lseek()
  * Function returns
- *    >=0 : numer of bytes read.
+ *    >=0 : Success
  * -errno : An error occured.
  */
 EXTERN int nfs_lseek(struct nfs_context *nfs, struct nfsfh *nfsfh,
@@ -1122,39 +1138,6 @@ EXTERN int nfs_creat_async(struct nfs_context *nfs, const char *path, int mode,
  */
 EXTERN int nfs_creat(struct nfs_context *nfs, const char *path, int mode,
                      struct nfsfh **nfsfh);
-
-/*
- * Async create()
- *
- * Same as nfs_creat_async but allows passing flags:
- * O_NOFOLLOW
- * O_APPEND
- * O_SYNC
- * O_EXCL
- * O_TRUNC
- *
- * Function returns
- *  0 : The command was queued successfully. The callback will be invoked once
- *      the command completes.
- * <0 : An error occured when trying to queue the command.
- *      The callback will not be invoked.
- *
- * When the callback is invoked, status indicates the result:
- *      0 : Success.
- *          data is a struct *nfsfh;
- * -errno : An error occured.
- *          data is the error string.
- */
-EXTERN int nfs_create_async(struct nfs_context *nfs, const char *path,
-                            int flags, int mode, nfs_cb cb, void *private_data);
-/*
- * Sync create()
- * Function returns
- *      0 : Success
- * -errno : An error occured.
- */
-EXTERN int nfs_create(struct nfs_context *nfs, const char *path, int flags,
-                      int mode, struct nfsfh **nfsfh);
 
 
 /*
@@ -2018,6 +2001,9 @@ EXTERN int nfs_get_poll_timeout(struct nfs_context *nfs);
  * int milliseconds : timeout to be applied in milliseconds (-1 no timeout)
  *                    timeouts must currently be set in whole seconds,
  *                    i.e. units of 1000
+ *
+ * Note: Prefer the mount option timeo=<int> to set the timeout over directly
+ *       calling nfs_set_timeout().
  */
 EXTERN void nfs_set_timeout(struct nfs_context *nfs, int milliseconds);
 

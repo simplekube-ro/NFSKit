@@ -26,6 +26,12 @@ let package = Package(
             swiftSettings: [
                 .enableExperimentalFeature("StrictConcurrency")
             ]),
+        .testTarget(
+            name: "NFSKitIntegrationTests",
+            dependencies: ["NFSKit"],
+            swiftSettings: [
+                .enableExperimentalFeature("StrictConcurrency")
+            ]),
         .target(
             name: "nfs",
             dependencies: ["Libnfs"],

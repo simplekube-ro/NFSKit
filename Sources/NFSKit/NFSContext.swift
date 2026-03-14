@@ -104,25 +104,24 @@ extension NFSContext {
     var isConnected: Bool {
         do {
             return try withThreadSafeContext { (context) -> Bool in
-                context.pointee.server != nil && context.pointee.rpc.pointee.is_connected != 0
+                guard let serverPtr = nfs_get_server(context) else { return false }
+                // Use nfs_get_fd() >= 0 as a connectivity proxy, replacing the
+                // removed rpc.pointee.is_connected field.
+                return serverPtr.pointee != 0 && nfs_get_fd(context) >= 0
             }
         } catch {
             return false
         }
     }
-    
+
     var server: String? {
-        if let server = context?.pointee.server {
-            return String(cString: server)
-        }
-        return nil
+        guard let ctx = context, let serverPtr = nfs_get_server(ctx) else { return nil }
+        return String(cString: serverPtr)
     }
-    
+
     var export: String? {
-        if let export = context?.pointee.export {
-            return String(cString: export)
-        }
-        return nil
+        guard let ctx = context, let exportPtr = nfs_get_export(ctx) else { return nil }
+        return String(cString: exportPtr)
     }
     
     var fileDescriptor: Int32 {
@@ -159,17 +158,8 @@ extension NFSContext {
 // MARK: - Performance Tuning
 extension NFSContext {
 
-    func setReadMax(_ bytes: UInt64) throws {
+    func setReadMax(_ bytes: Int) throws {
         try withThreadSafeContext { nfs_set_readmax($0, bytes) }
-    }
-
-    func setReadAhead(_ bytes: UInt32) throws {
-        try withThreadSafeContext { nfs_set_readahead($0, bytes) }
-    }
-
-    func setPageCache(pages: UInt32, ttl: UInt32 = 30) throws {
-        try withThreadSafeContext { nfs_set_pagecache($0, pages) }
-        try withThreadSafeContext { nfs_set_pagecache_ttl($0, ttl) }
     }
 
     @discardableResult

@@ -83,6 +83,9 @@ brew list pkg-config || brew install pkg-config
 brew list automake || brew install automake
 brew list cmake || brew install cmake
 
+# Remove config.h sentinel so it gets refreshed from the first cmake build
+rm -f "$ROOT/Sources/nfs/include/config.h.updated"
+
 for PLATFORM in $PLATFORMS; do
     #rm -rf build/scratch-$PLATFORM
     if [[ "$PLATFORM" = "macos" ]]; then
