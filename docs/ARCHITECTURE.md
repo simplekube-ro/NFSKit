@@ -25,10 +25,10 @@ only with the layer directly beneath it.
 
 ```mermaid
 flowchart TD
-    A["NFSClient\n(Sources/NFSKit/NFSClient.swift)\nPublic API — Sendable, all-let properties"]
-    B["NFSEventLoop\n(Sources/NFSKit/NFSEventLoop.swift)\nOwns nfs_context*, DispatchSources,\ncontinuation registry, pipeline controllers"]
-    C["nfs C bridge\n(Sources/nfs/)\nSwift-importable C module\nnfs_shim.h aggregates libnfs headers"]
-    D["Libnfs.xcframework\n(Framework/)\nPre-built libnfs 6.0.2 binary\nfor all Apple platform slices"]
+    A["NFSClient<br/>(Sources/NFSKit/NFSClient.swift)<br/>Public API — Sendable, all-let properties"]
+    B["NFSEventLoop<br/>(Sources/NFSKit/NFSEventLoop.swift)<br/>Owns nfs_context*, DispatchSources,<br/>continuation registry, pipeline controllers"]
+    C["nfs C bridge<br/>(Sources/nfs/)<br/>Swift-importable C module<br/>nfs_shim.h aggregates libnfs headers"]
+    D["Libnfs.xcframework<br/>(Framework/)<br/>Pre-built libnfs 6.0.2 binary<br/>for all Apple platform slices"]
 
     A -->|"delegates all I/O to"| B
     B -->|"calls nfs_*_async() via"| C
@@ -125,12 +125,12 @@ flowchart TD
     Start([Operation completes]) --> Success{Success?}
 
     Success -->|yes| SlowStart{Phase == slowStart?}
-    SlowStart -->|yes| Double["depth = depth × 2\nif depth ≥ ssthresh → phase = steady"]
-    SlowStart -->|no| Add["depth += 1 / depth\n(additive increase)"]
+    SlowStart -->|yes| Double["depth = depth × 2<br/>if depth ≥ ssthresh → phase = steady"]
+    SlowStart -->|no| Add["depth += 1 / depth<br/>(additive increase)"]
     Double --> Clamp["depth = min(depth, maxDepth)"]
     Add --> Clamp
 
-    Success -->|no| Fail["ssthresh = max(minDepth, depth / 2)\ndepth = max(minDepth, depth / 2)\nphase = steady\n(never re-enter slow start)"]
+    Success -->|no| Fail["ssthresh = max(minDepth, depth / 2)<br/>depth = max(minDepth, depth / 2)<br/>phase = steady<br/>(never re-enter slow start)"]
 
     Clamp --> Issue[issuePendingOperations]
     Fail --> Issue
@@ -240,12 +240,12 @@ headers: `HAVE_CONFIG_H`, `HAVE_SOCKADDR_LEN`, `_FILE_OFFSET_BITS=64`, and the
 
 ```mermaid
 flowchart LR
-    Vendor["Vendor/libnfs\n(git submodule, libnfs 6.0.2)"]
-    Build["build.sh\nautotools + CMake\nper platform/arch"]
-    Libs["Static libs\n.a per platform slice"]
-    Lipo["lipo\nfat binary per platform"]
-    XCF["xcodebuild\n-create-xcframework"]
-    Out["Framework/\nLibnfs.xcframework"]
+    Vendor["Vendor/libnfs<br/>(git submodule, libnfs 6.0.2)"]
+    Build["build.sh<br/>autotools + CMake<br/>per platform/arch"]
+    Libs["Static libs<br/>.a per platform slice"]
+    Lipo["lipo<br/>fat binary per platform"]
+    XCF["xcodebuild<br/>-create-xcframework"]
+    Out["Framework/<br/>Libnfs.xcframework"]
 
     Vendor --> Build --> Libs --> Lipo --> XCF --> Out
 ```
