@@ -2,9 +2,28 @@
 
 Swift NFS client for Apple platforms, built on [libnfs](https://github.com/sahlberg/libnfs).
 
+Forked from [alexiscn/NFSKit](https://github.com/alexiscn/NFSKit) and substantially rewritten with a new event loop architecture, adaptive pipelining, libnfs 6.x support, and security hardening.
+
 ![Swift 5.9+](https://img.shields.io/badge/Swift-5.9+-orange.svg)
 ![Platforms](https://img.shields.io/badge/Platforms-macOS%20|%20iOS%20|%20tvOS%20|%20Catalyst-blue.svg)
 ![License](https://img.shields.io/badge/License-MIT%20%2B%20LGPL%20v2.1-green.svg)
+
+## What's Different from the Original
+
+The [original NFSKit](https://github.com/alexiscn/NFSKit) by [@alexiscn](https://github.com/alexiscn) provided a synchronous NFS wrapper using `poll()` loops and `NSRecursiveLock`. This fork replaces the internals while preserving the public API shape:
+
+| Area | Original | This Fork |
+|------|----------|-----------|
+| **Event loop** | Blocking `poll()` with `NSRecursiveLock` | Non-blocking `DispatchSource` on a serial queue |
+| **Concurrency** | Basic async/await wrappers | Full `Sendable` conformance, `CheckedContinuation` throughout |
+| **libnfs version** | 4.x | 6.0.2 — zero-copy reads, `pread`/`pwrite`, RPC stats |
+| **Pipelining** | Sequential (one RPC at a time) | Adaptive AIMD congestion control (up to 32 concurrent RPCs) |
+| **Reads** | Copy-based chunked reads | Zero-copy pre-allocated buffer path for files up to 64 MB |
+| **Security** | No security API | `NFSSecurity` enum with Kerberos 5/5i/5p support |
+| **Error handling** | Silent `try?` on config, `ECANCELED` fallback | Throwing APIs, proper error propagation, `EIO` fallback |
+| **Memory safety** | `as!` force-casts, leaked write buffers on error | Safe `as?` casts, cleanup closures, queue-confinement assertions |
+| **Thread safety** | `NFSDirectory` not thread-safe, no runtime checks | All legacy unsafe types removed, `dispatchPrecondition` assertions |
+| **Testing** | No tests | 101 unit tests + 32 integration tests (Docker NFS) |
 
 ## Features
 
@@ -137,4 +156,6 @@ NFSKit source code is licensed under the [MIT License](LICENSE).
 
 ## Acknowledgements
 
-Architecture inspired by [AMSMB2](https://github.com/amosavian/AMSMB2). Thanks to [amosavian](https://github.com/amosavian) and [sahlberg](https://github.com/sahlberg) for their excellent work.
+- **[alexiscn](https://github.com/alexiscn)** — Original NFSKit author. The public API design and initial libnfs integration come from [alexiscn/NFSKit](https://github.com/alexiscn/NFSKit).
+- **[amosavian](https://github.com/amosavian)** — [AMSMB2](https://github.com/amosavian/AMSMB2) inspired the architecture patterns used in this fork.
+- **[sahlberg](https://github.com/sahlberg)** — Creator of [libnfs](https://github.com/sahlberg/libnfs), the C library that makes all of this possible.
